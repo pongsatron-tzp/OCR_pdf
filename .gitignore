@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# Virtual env
+.venv/
+env/
+venv/
+
+# VSCode
+.vscode/
+
+# Environment/config
+key.env
+job_status.json
+
+# OS
+.DS_Store
+Thumbs.db
