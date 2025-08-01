@@ -6,6 +6,7 @@ import json
 from typing import List, Dict, Any, Optional, Tuple, Set
 import uuid
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 # Fastapi
 from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form, Path, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
@@ -57,11 +58,82 @@ OLLAMA_EMBEDDING_MODEL_NAME = os.getenv("OLLAMA_EMBEDDING_MODEL_NAME", "hf.co/Qw
 JOB_STATUS_FILE = "job_status.json"
 job_status_lock = asyncio.Lock()
 
+# --- Global Client Instances ---
+vision_model: Optional[genai.GenerativeModel] = None
+qdrant_client: Optional[QdrantClient] = None
+semaphore_embedding_call: Optional[asyncio.Semaphore] = None
+semaphore_ocr_call: Optional[asyncio.Semaphore] = None
+page_processing_semaphore: Optional[asyncio.Semaphore] = None
+
+# --- [เพิ่มฟังก์ชันกลับเข้ามา] ---
+async def notify_startup():
+    if not N8N_WEBHOOK_URL:
+        logger.warning("[Startup] ไม่ได้ตั้งค่า N8N_WEBHOOK_URL, ข้ามการส่ง notification")
+        return
+    
+    startup_webhook_url = f"{N8N_WEBHOOK_URL}_startup"
+    logger.info(f"กำลังส่ง Startup Webhook notification ไปที่: {startup_webhook_url}")
+    
+    payload = {
+        "status": "online",
+        "message": "PDF Processing Service has started successfully.",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(startup_webhook_url, json=payload, timeout=30)
+            response.raise_for_status()
+            logger.info(f"ส่ง Startup Webhook notification สำเร็จ! Status: {response.status_code}")
+    except httpx.RequestError as e:
+        logger.error(f"เกิดข้อผิดพลาดในการเชื่อมต่อเพื่อส่ง Startup Webhook: {e}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Startup Webhook URL ตอบกลับด้วยสถานะผิดพลาด: {e.response.status_code} - {e.response.text}")
+
+# --- Lifespan Event Handler ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global vision_model, qdrant_client, semaphore_embedding_call, semaphore_ocr_call, page_processing_semaphore
+    logger.info("Application startup initiated...")
+    required_vars = [GEMINI_API_KEY, QDRANT_URL, QDRANT_API_KEY, LIBRARY_API_TOKEN]
+    if not all(required_vars):
+        logger.critical("ไม่พบตัวแปร Environment ที่จำเป็น. บริการไม่สามารถเริ่มต้นได้")
+        sys.exit(1)
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        vision_model = genai.GenerativeModel('gemini-1.5-flash')
+        response = await asyncio.to_thread(vision_model.generate_content, "test vision model connectivity")
+        if not response.text: raise Exception("Gemini Vision model test returned no text.")
+        logger.info("โหลดและทดสอบ Gemini Vision Model ('gemini-1.5-flash') สำเร็จแล้ว")
+    except Exception as e:
+        logger.critical(f"โหลดหรือทดสอบ Gemini Vision Model ล้มเหลว: {e}", exc_info=True)
+        sys.exit(1)
+    try:
+        qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
+        await asyncio.to_thread(qdrant_client.get_collections)
+        logger.info("เชื่อมต่อกับ Qdrant Cloud Client สำเร็จแล้ว")
+    except Exception as e:
+        logger.critical(f"เชื่อมต่อกับ Qdrant Cloud Client ล้มเหลว: {e}", exc_info=True)
+        sys.exit(1)
+    semaphore_embedding_call = asyncio.Semaphore(CONCURRENCY)
+    semaphore_ocr_call = asyncio.Semaphore(CONCURRENCY)
+    page_processing_semaphore = asyncio.Semaphore(PAGE_CONCURRENCY)
+    logger.info(f"การเริ่มต้นบริการเสร็จสมบูรณ์. API Concurrency: {CONCURRENCY}, Page Concurrency: {PAGE_CONCURRENCY}.")
+    
+    tasks = BackgroundTasks()
+    tasks.add_task(notify_startup)
+    await tasks()
+    
+    yield
+    
+    logger.info("Application shutdown.")
+
 # --- FastAPI Application ---
 app = FastAPI(
     title="บริการประมวลผล PDF (Asynchronous with Job Tracking)",
     description="รับไฟล์, คืน Path สำหรับติดตาม, ประมวลผลในเบื้องหลัง, และสามารถตรวจสอบสถานะได้",
-    version="2.2.1"
+    version="2.3.1",
+    lifespan=lifespan
 )
 
 # --- Pydantic Models ---
@@ -105,42 +177,6 @@ class JobStatusResponse(BaseModel):
     file_path: str
     details: JobStatus
 
-# --- Global Client Instances ---
-vision_model: Optional[genai.GenerativeModel] = None
-qdrant_client: Optional[QdrantClient] = None
-semaphore_embedding_call: Optional[asyncio.Semaphore] = None
-semaphore_ocr_call: Optional[asyncio.Semaphore] = None
-page_processing_semaphore: Optional[asyncio.Semaphore] = None
-
-# --- Startup Event Handler ---
-@app.on_event("startup")
-async def startup_event():
-    global vision_model, qdrant_client, semaphore_embedding_call, semaphore_ocr_call, page_processing_semaphore
-    required_vars = [GEMINI_API_KEY, QDRANT_URL, QDRANT_API_KEY, LIBRARY_API_TOKEN]
-    if not all(required_vars):
-        logger.critical("ไม่พบตัวแปร Environment ที่จำเป็น. บริการไม่สามารถเริ่มต้นได้")
-        sys.exit(1)
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        vision_model = genai.GenerativeModel('gemini-2.5-flash')  
-        response = await asyncio.to_thread(vision_model.generate_content, "test vision model connectivity")
-        if not response.text: raise Exception("Gemini Vision model test returned no text.")
-        logger.info("โหลดและทดสอบ Gemini Vision Model ('gemini-2.5-flash') สำเร็จแล้ว")
-    except Exception as e:
-        logger.critical(f"โหลดหรือทดสอบ Gemini Vision Model ล้มเหลว: {e}", exc_info=True)
-        sys.exit(1)
-    try:
-        qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
-        await asyncio.to_thread(qdrant_client.get_collections)
-        logger.info("เชื่อมต่อกับ Qdrant Cloud Client สำเร็จแล้ว")
-    except Exception as e:
-        logger.critical(f"เชื่อมต่อกับ Qdrant Cloud Client ล้มเหลว: {e}", exc_info=True)
-        sys.exit(1)
-    semaphore_embedding_call = asyncio.Semaphore(CONCURRENCY)
-    semaphore_ocr_call = asyncio.Semaphore(CONCURRENCY)
-    page_processing_semaphore = asyncio.Semaphore(PAGE_CONCURRENCY)
-    logger.info(f"การเริ่มต้นบริการเสร็จสมบูรณ์. API Concurrency: {CONCURRENCY}, Page Concurrency: {PAGE_CONCURRENCY}.")
-
 # --- Helper Functions for Job Status ---
 async def _read_job_statuses() -> Dict[str, Any]:
     async with job_status_lock:
@@ -166,6 +202,22 @@ async def update_job_status(file_path: str, status: str, details: Optional[Dict[
     if details:
         statuses[file_path].update(details)
     await _write_job_statuses(statuses)
+
+# --- [เพิ่มฟังก์ชันกลับเข้ามา] ---
+async def notify_webhook(result_data: ProcessingResponse):
+    if not N8N_WEBHOOK_URL:
+        logger.warning("[BG] ไม่ได้ตั้งค่า N8N_WEBHOOK_URL, ข้ามการส่ง notification")
+        return
+    logger.info(f"[BG] กำลังส่ง Webhook notification ไปที่: {N8N_WEBHOOK_URL}")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(N8N_WEBHOOK_URL, json=json.loads(result_data.model_dump_json()), timeout=30)
+            response.raise_for_status()
+            logger.info(f"[BG] ส่ง Webhook notification สำเร็จ! Status: {response.status_code}")
+    except httpx.RequestError as e:
+        logger.error(f"[BG] เกิดข้อผิดพลาดในการเชื่อมต่อเพื่อส่ง Webhook: {e}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"[BG] Webhook URL ตอบกลับด้วยสถานะผิดพลาด: {e.response.status_code} - {e.response.text}")
 
 # --- Other Helper Functions ---
 def parse_page_string(page_str: Optional[str]) -> Set[int]:
@@ -244,7 +296,6 @@ async def search_library_for_book(query: str) -> Optional[List[Dict[str, Any]]]:
         return None
 
 async def download_book_from_library(file_path: str) -> Optional[Tuple[str, bytes]]:
-    logger.info(f"Using LIBRARY_API_TOKEN: '{LIBRARY_API_TOKEN}'") 
     filename = os.path.basename(file_path)
     download_url = f"{LIBRARY_API_BASE_URL}/files/download/{file_path}"
     headers = {"Authorization": f"Bearer {LIBRARY_API_TOKEN}"}
@@ -402,24 +453,6 @@ async def page_worker_with_semaphore(doc: fitz.Document, page_num: int, file_nam
     async with page_processing_semaphore:
         return await process_and_upsert_single_page(doc, page_num, file_name, collection_name)
 
-async def notify_webhook(result_data: ProcessingResponse):
-    if not N8N_WEBHOOK_URL:
-        logger.warning("[BG] ไม่ได้ตั้งค่า N8N_WEBHOOK_URL, ข้ามการส่ง notification")
-        return
-    logger.info(f"[BG] กำลังส่ง Webhook notification ไปที่: {N8N_WEBHOOK_URL}")
-    try:
-        async with httpx.AsyncClient() as client:
-            # Use .dict() for Pydantic v1, .model_dump() for Pydantic v2
-            # The provided code uses FastAPI which often implies Pydantic v1 or compatibility.
-            # json.loads(result_data.json()) is a safe way that works for both.
-            response = await client.post(N8N_WEBHOOK_URL, json=json.loads(result_data.json()), timeout=30)
-            response.raise_for_status()
-            logger.info(f"[BG] ส่ง Webhook notification สำเร็จ! Status: {response.status_code}")
-    except httpx.RequestError as e:
-        logger.error(f"[BG] เกิดข้อผิดพลาดในการเชื่อมต่อเพื่อส่ง Webhook: {e}")
-    except httpx.HTTPStatusError as e:
-        logger.error(f"[BG] Webhook URL ตอบกลับด้วยสถานะผิดพลาด: {e.response.status_code} - {e.response.text}")
-
 async def process_pdf_in_background(
     file_path_key: str,
     file_bytes: bytes,
@@ -458,7 +491,6 @@ async def process_pdf_in_background(
             
         if not pages_to_process:
             logger.warning(f"[BG] หน้าที่ร้องขอทั้งหมดสำหรับไฟล์ '{cleaned_source_name}' มีอยู่แล้วใน collection. ข้ามการประมวลผล")
-            doc.close()
             final_response = ProcessingResponse(collection_name=collection_name, status="skipped", processed_chunks=0, failed_chunks=0, message="หน้าที่ร้องขอทั้งหมดมีอยู่แล้วใน collection", file_name=original_file_name)
         else:
             pages_to_iterate = sorted([p for p in pages_to_process if 1 <= p <= total_pages_in_doc])
@@ -481,15 +513,18 @@ async def process_pdf_in_background(
                 message = f"ไม่มี chunks ใหม่ใดๆ ถูกประมวลผลสำเร็จสำหรับ {original_file_name}."
                 status_code = "warning" if total_failed_chunks == 0 else "error"
             final_response = ProcessingResponse(collection_name=collection_name, status=status_code, processed_chunks=total_successful_chunks, failed_chunks=total_failed_chunks, message=message, file_name=original_file_name)
-        await update_job_status(file_path_key, "completed", {"result": json.loads(final_response.json())})
+        
+        await update_job_status(file_path_key, "completed", {"result": json.loads(final_response.model_dump_json())})
+
     except Exception as e:
         logger.error(f"[BG Task] เกิดข้อผิดพลาดรุนแรงที่ไม่สามารถจัดการได้: {e}", exc_info=True)
         error_message = f"เกิดข้อผิดพลาดรุนแรงระหว่างการประมวลผล: {e}"
         final_response = ProcessingResponse(collection_name=collection_name, status="failed", processed_chunks=0, failed_chunks=0, message=error_message, file_name=original_file_name)
         await update_job_status(file_path_key, "failed", {"error": error_message})
     finally:
-        if doc and doc.is_open:
+        if doc is not None:
             doc.close()
+            logger.info(f"[BG] ปิดเอกสาร '{original_file_name}' เรียบร้อยแล้ว")
         if final_response:
             await notify_webhook(final_response)
 
@@ -574,4 +609,4 @@ if __name__ == "__main__":
         logger.critical("ไม่พบตัวแปรสภาพแวดล้อมที่จำเป็น. โปรดตรวจสอบ key.env")
         sys.exit(1)
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run("pdf:app", host="0.0.0.0", port=8080, reload=True)
