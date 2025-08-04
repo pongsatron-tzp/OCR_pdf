@@ -26,6 +26,7 @@ import requests
 import grpc
 import httpx
 import aiofiles
+from urllib.parse import urljoin, quote
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -43,7 +44,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 LIBRARY_API_TOKEN = os.getenv("LIBRARY_API_TOKEN")
-LIBRARY_API_BASE_URL = "https://library-storage.agilesoftgroup.com/api"
+LIBRARY_API_BASE_URL = "https://library-storage.agilesoftgroup.com"
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 
 # --- Global Settings ---
@@ -71,7 +72,7 @@ async def notify_startup():
         logger.warning("[Startup] ไม่ได้ตั้งค่า N8N_WEBHOOK_URL, ข้ามการส่ง notification")
         return
     
-    startup_webhook_url = f"{N8N_WEBHOOK_URL}_startup"
+    startup_webhook_url = f"{N8N_WEBHOOK_URL}"
     logger.info(f"กำลังส่ง Startup Webhook notification ไปที่: {startup_webhook_url}")
     
     payload = {
@@ -295,17 +296,27 @@ async def search_library_for_book(query: str) -> Optional[List[Dict[str, Any]]]:
         logger.error(f"เกิดข้อผิดพลาดในการเชื่อมต่อเพื่อค้นหาหนังสือใน Library: {e}")
         return None
 
+# ที่ส่วนบนสุดของไฟล์ อย่าลืม import สิ่งนี้ด้วย
+from urllib.parse import urljoin, quote
+
 async def download_book_from_library(file_path: str) -> Optional[Tuple[str, bytes]]:
+    """
+    ดาวน์โหลดไฟล์จาก Library API พร้อมแสดง Log ความคืบหน้า และสร้าง URL อย่างปลอดภัย
+    """
     filename = os.path.basename(file_path)
-    download_url = f"{LIBRARY_API_BASE_URL}/files/download/{file_path}"
+    encoded_path = quote(file_path, safe='')
+    download_path = f"api/files/download/{encoded_path}"
+    download_url = urljoin(LIBRARY_API_BASE_URL, download_path)
     headers = {"Authorization": f"Bearer {LIBRARY_API_TOKEN}"}
-    logger.info(f"กำลังเริ่มดาวน์โหลดไฟล์ '{filename}' จาก Library...")
+    logger.info(f"กำลังเริ่มดาวน์โหลดไฟล์ '{filename}' จาก URL: {download_url}")
     def _blocking_download_with_progress():
         try:
             with requests.get(download_url, headers=headers, stream=True, timeout=300) as r:
                 r.raise_for_status()
+                
                 total_size_in_bytes = int(r.headers.get('content-length', 0))
                 file_in_memory = io.BytesIO()
+                
                 if total_size_in_bytes == 0:
                     logger.warning("ไม่พบข้อมูล Content-Length, ไม่สามารถแสดงความคืบหน้าเป็น % ได้")
                     for chunk in r.iter_content(chunk_size=8192):
@@ -321,12 +332,17 @@ async def download_book_from_library(file_path: str) -> Optional[Tuple[str, byte
                             if current_percent >= last_logged_percent + 10:
                                 logger.info(f"Downloading '{filename}'... {current_percent}%")
                                 last_logged_percent = current_percent
+
                 logger.info(f"ดาวน์โหลดไฟล์ '{filename}' จาก Library สำเร็จ (100%)")
                 return file_in_memory.getvalue()
+
         except requests.exceptions.RequestException as e:
             logger.error(f"เกิดข้อผิดพลาดระหว่างดาวน์โหลดไฟล์ '{filename}' จาก Library: {e}")
             return None
+
+    # เรียกใช้ฟังก์ชัน blocking ใน thread แยกต่างหาก
     file_bytes = await asyncio.to_thread(_blocking_download_with_progress)
+    
     if file_bytes is not None:
         return filename, file_bytes
     else:
