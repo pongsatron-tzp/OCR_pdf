@@ -101,10 +101,10 @@ async def lifespan(app: FastAPI):
         sys.exit(1)
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        vision_model = genai.GenerativeModel('gemini-1.5-flash')
+        vision_model = genai.GenerativeModel('gemini-2.5-flash')
         response = await asyncio.to_thread(vision_model.generate_content, "test vision model connectivity")
         if not response.text: raise Exception("Gemini Vision model test returned no text.")
-        logger.info("โหลดและทดสอบ Gemini Vision Model ('gemini-1.5-flash') สำเร็จแล้ว")
+        logger.info("โหลดและทดสอบ Gemini Vision Model ('gemini-2.5-flash') สำเร็จแล้ว")
     except Exception as e:
         logger.critical(f"โหลดหรือทดสอบ Gemini Vision Model ล้มเหลว: {e}", exc_info=True)
         sys.exit(1)
@@ -386,6 +386,7 @@ async def ensure_qdrant_collection(collection_name: str):
     try:
         await asyncio.to_thread(qdrant_client.get_collection, collection_name=collection_name)
     except Exception:
+        # ถ้าไม่มี ให้สร้างขึ้นมาใหม่
         logger.info(f"ไม่พบ Collection '{collection_name}' กำลังสร้าง...")
         await asyncio.to_thread(
             qdrant_client.create_collection,
@@ -393,14 +394,50 @@ async def ensure_qdrant_collection(collection_name: str):
             vectors_config=models.VectorParams(size=QDRANT_VECTOR_SIZE, distance=models.Distance.COSINE),
         )
         logger.info(f"Collection '{collection_name}' สร้างสำเร็จแล้ว.")
-        logger.info(f"กำลังสร้าง Payload Index สำหรับฟิลด์ 'metadata.source' ใน collection '{collection_name}'...")
+
+        # สร้าง Index สำหรับ source (เหมือนเดิม)
+        logger.info(f"กำลังสร้าง Payload Index (Keyword) สำหรับ 'metadata.source'...")
         await asyncio.to_thread(
             qdrant_client.create_payload_index,
             collection_name=collection_name,
             field_name="metadata.source",
             field_schema=models.PayloadSchemaType.KEYWORD
         )
-        logger.info(f"สร้าง Payload Index สำหรับ 'metadata.source' สำเร็จแล้ว.")
+        
+        # 2. Index สำหรับ pageNumber
+        logger.info(f"กำลังสร้าง Payload Index (Integer) สำหรับ 'metadata.loc.pageNumber'...")
+        await asyncio.to_thread(
+            qdrant_client.create_payload_index,
+            collection_name=collection_name,
+            field_name="metadata.loc.pageNumber",
+            field_schema=models.PayloadSchemaType.INTEGER
+        )
+        
+        # 3. Index สำหรับ chunkIndex
+        logger.info(f"กำลังสร้าง Payload Index (Integer) สำหรับ 'metadata.loc.chunkIndex'...")
+        await asyncio.to_thread(
+            qdrant_client.create_payload_index,
+            collection_name=collection_name,
+            field_name="metadata.loc.chunkIndex",
+            field_schema=models.PayloadSchemaType.INTEGER
+        )
+
+        # สร้าง Index สำหรับ pageContent (Full-text search)
+        logger.info(f"กำลังสร้าง Payload Index (Full-text) สำหรับ 'pageContent'...")
+        await asyncio.to_thread(
+            qdrant_client.create_payload_index,
+            collection_name=collection_name,
+            field_name="pageContent",
+            field_schema=models.TextIndexParams(
+                type=models.TextIndexType.TEXT,
+                tokenizer=models.TokenizerType.WHITESPACE,
+                min_token_len=2,
+                max_token_len=15,
+                lowercase=True
+            )
+        )
+        logger.info(f"สร้าง Payload Index ทั้งหมดสำหรับ collection '{collection_name}' สำเร็จแล้ว.")
+
 
 async def process_and_upsert_single_page(doc: fitz.Document, page_num: int, file_name: str, collection_name: str) -> Tuple[int, int]:
     global vision_model, semaphore_ocr_call, qdrant_client
