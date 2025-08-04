@@ -27,11 +27,9 @@ import grpc
 import httpx
 import aiofiles
 from urllib.parse import urljoin, quote
-
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 # --- Environment Variable Loading ---
 dotenv_path_key = os.path.join(os.path.dirname(__file__), 'key.env')
 if os.path.exists(dotenv_path_key):
@@ -39,14 +37,12 @@ if os.path.exists(dotenv_path_key):
     logger.info("โหลดตัวแปรสภาพแวดล้อมจาก key.env แล้ว")
 else:
     load_dotenv()
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 LIBRARY_API_TOKEN = os.getenv("LIBRARY_API_TOKEN")
 LIBRARY_API_BASE_URL = "https://library-storage.agilesoftgroup.com"
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
-
 # --- Global Settings ---
 CONCURRENCY = 6
 PAGE_CONCURRENCY = 6
@@ -58,14 +54,12 @@ OLLAMA_EMBEDDING_URL = os.getenv("OLLAMA_EMBEDDING_URL", "http://192.168.1.10:11
 OLLAMA_EMBEDDING_MODEL_NAME = os.getenv("OLLAMA_EMBEDDING_MODEL_NAME", "hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF:latest")
 JOB_STATUS_FILE = "job_status.json"
 job_status_lock = asyncio.Lock()
-
 # --- Global Client Instances ---
 vision_model: Optional[genai.GenerativeModel] = None
 qdrant_client: Optional[QdrantClient] = None
 semaphore_embedding_call: Optional[asyncio.Semaphore] = None
 semaphore_ocr_call: Optional[asyncio.Semaphore] = None
 page_processing_semaphore: Optional[asyncio.Semaphore] = None
-
 # --- [เพิ่มฟังก์ชันกลับเข้ามา] ---
 async def notify_startup():
     if not N8N_WEBHOOK_URL:
@@ -90,7 +84,6 @@ async def notify_startup():
         logger.error(f"เกิดข้อผิดพลาดในการเชื่อมต่อเพื่อส่ง Startup Webhook: {e}")
     except httpx.HTTPStatusError as e:
         logger.error(f"Startup Webhook URL ตอบกลับด้วยสถานะผิดพลาด: {e.response.status_code} - {e.response.text}")
-
 # --- Lifespan Event Handler ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -128,7 +121,6 @@ async def lifespan(app: FastAPI):
     yield
     
     logger.info("Application shutdown.")
-
 # --- FastAPI Application ---
 app = FastAPI(
     title="บริการประมวลผล PDF (Asynchronous with Job Tracking)",
@@ -136,7 +128,6 @@ app = FastAPI(
     version="2.3.1",
     lifespan=lifespan
 )
-
 # --- Pydantic Models ---
 class ProcessingResponse(BaseModel):
     collection_name: str
@@ -145,12 +136,10 @@ class ProcessingResponse(BaseModel):
     failed_chunks: int
     message: str
     file_name: str
-
 class LibrarySearchRequest(BaseModel):
     query: str
     pages: Optional[str] = None
     collection_name: Optional[str] = None
-
 class ProcessByPathRequest(BaseModel):
     file_path: str
     pages: Optional[str] = None
@@ -160,12 +149,10 @@ class SourceListResponse(BaseModel):
     collection_name: str
     source_count: int
     sources: List[str]
-
 class AcknowledgementResponse(BaseModel):
     message: str
     file_path: str
     task_status: str
-
 class JobStatus(BaseModel):
     status: str
     file_path: str
@@ -173,11 +160,9 @@ class JobStatus(BaseModel):
     updated_at: str
     result: Optional[ProcessingResponse] = None
     error: Optional[str] = None
-
 class JobStatusResponse(BaseModel):
     file_path: str
     details: JobStatus
-
 # --- Helper Functions for Job Status ---
 async def _read_job_statuses() -> Dict[str, Any]:
     async with job_status_lock:
@@ -187,12 +172,10 @@ async def _read_job_statuses() -> Dict[str, Any]:
             content = await f.read()
             if not content: return {}
             return json.loads(content)
-
 async def _write_job_statuses(statuses: Dict[str, Any]):
     async with job_status_lock:
         async with aiofiles.open(JOB_STATUS_FILE, mode='w') as f:
             await f.write(json.dumps(statuses, indent=2))
-
 async def update_job_status(file_path: str, status: str, details: Optional[Dict[str, Any]] = None):
     statuses = await _read_job_statuses()
     now_utc = datetime.now(timezone.utc).isoformat()
@@ -203,7 +186,6 @@ async def update_job_status(file_path: str, status: str, details: Optional[Dict[
     if details:
         statuses[file_path].update(details)
     await _write_job_statuses(statuses)
-
 # --- [เพิ่มฟังก์ชันกลับเข้ามา] ---
 async def notify_webhook(result_data: ProcessingResponse):
     if not N8N_WEBHOOK_URL:
@@ -219,7 +201,6 @@ async def notify_webhook(result_data: ProcessingResponse):
         logger.error(f"[BG] เกิดข้อผิดพลาดในการเชื่อมต่อเพื่อส่ง Webhook: {e}")
     except httpx.HTTPStatusError as e:
         logger.error(f"[BG] Webhook URL ตอบกลับด้วยสถานะผิดพลาด: {e.response.status_code} - {e.response.text}")
-
 # --- Other Helper Functions ---
 def parse_page_string(page_str: Optional[str]) -> Set[int]:
     if not page_str: return set()
@@ -238,7 +219,6 @@ def parse_page_string(page_str: Optional[str]) -> Set[int]:
         except ValueError:
             logger.warning(f"ไม่สามารถแปลงค่าหน้า '{part}' ได้ จะข้ามส่วนนี้ไป")
     return page_numbers
-
 async def get_existing_page_numbers(collection_name: str, source_file_name: str) -> Set[int]:
     global qdrant_client
     if qdrant_client is None: return set()
@@ -258,7 +238,6 @@ async def get_existing_page_numbers(collection_name: str, source_file_name: str)
     except Exception as e:
         logger.warning(f"เกิดข้อผิดพลาดขณะดึงข้อมูลหน้าที่มีอยู่: {e}. จะถือว่ายังไม่มีหน้าใดๆ")
         return set()
-
 async def list_unique_sources_in_collection(collection_name: str) -> List[str]:
     global qdrant_client
     if qdrant_client is None:
@@ -278,7 +257,6 @@ async def list_unique_sources_in_collection(collection_name: str) -> List[str]:
     except Exception as e:
         logger.error(f"เกิดข้อผิดพลาดขณะ list sources จาก collection '{collection_name}': {e}")
         raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found or an error occurred.")
-
 async def search_library_for_book(query: str) -> Optional[List[Dict[str, Any]]]:
     search_url = f"{LIBRARY_API_BASE_URL}/search"
     headers = {"Authorization": f"Bearer {LIBRARY_API_TOKEN}"}
@@ -295,10 +273,8 @@ async def search_library_for_book(query: str) -> Optional[List[Dict[str, Any]]]:
     except requests.exceptions.RequestException as e:
         logger.error(f"เกิดข้อผิดพลาดในการเชื่อมต่อเพื่อค้นหาหนังสือใน Library: {e}")
         return None
-
 # ที่ส่วนบนสุดของไฟล์ อย่าลืม import สิ่งนี้ด้วย
 from urllib.parse import urljoin, quote
-
 async def download_book_from_library(file_path: str) -> Optional[Tuple[str, bytes]]:
     """
     ดาวน์โหลดไฟล์จาก Library API พร้อมแสดง Log ความคืบหน้า และสร้าง URL อย่างปลอดภัย
@@ -332,14 +308,11 @@ async def download_book_from_library(file_path: str) -> Optional[Tuple[str, byte
                             if current_percent >= last_logged_percent + 10:
                                 logger.info(f"Downloading '{filename}'... {current_percent}%")
                                 last_logged_percent = current_percent
-
                 logger.info(f"ดาวน์โหลดไฟล์ '{filename}' จาก Library สำเร็จ (100%)")
                 return file_in_memory.getvalue()
-
         except requests.exceptions.RequestException as e:
             logger.error(f"เกิดข้อผิดพลาดระหว่างดาวน์โหลดไฟล์ '{filename}' จาก Library: {e}")
             return None
-
     # เรียกใช้ฟังก์ชัน blocking ใน thread แยกต่างหาก
     file_bytes = await asyncio.to_thread(_blocking_download_with_progress)
     
@@ -347,7 +320,6 @@ async def download_book_from_library(file_path: str) -> Optional[Tuple[str, byte
         return filename, file_bytes
     else:
         return None
-
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     if not text: return []
     chunks = []
@@ -359,7 +331,6 @@ def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
         start += (chunk_size - chunk_overlap)
         start = max(0, start)
     return chunks
-
 async def async_generate_embedding(input_data: List[str]) -> Optional[List[List[float]]]:
     if not input_data: return None
     url = OLLAMA_EMBEDDING_URL
@@ -380,7 +351,6 @@ async def async_generate_embedding(input_data: List[str]) -> Optional[List[List[
             embeddings.append(None)
     valid_embeddings = [e for e in embeddings if e is not None]
     return valid_embeddings if valid_embeddings else None
-
 async def async_process_text_chunk(chunk_text: str, chunk_metadata: Dict[str, Any]) -> models.PointStruct | None:
     global semaphore_embedding_call
     if semaphore_embedding_call is None: return None
@@ -395,7 +365,6 @@ async def async_process_text_chunk(chunk_text: str, chunk_metadata: Dict[str, An
             return None
         payload = {"pageContent": chunk_text, "metadata": chunk_metadata}
         return models.PointStruct(id=chunk_id, vector=embedding_results[0], payload=payload)
-
 async def ensure_qdrant_collection(collection_name: str):
     global qdrant_client
     if qdrant_client is None: raise RuntimeError("Qdrant client not initialized")
@@ -410,7 +379,6 @@ async def ensure_qdrant_collection(collection_name: str):
             vectors_config=models.VectorParams(size=QDRANT_VECTOR_SIZE, distance=models.Distance.COSINE),
         )
         logger.info(f"Collection '{collection_name}' สร้างสำเร็จแล้ว.")
-
         # สร้าง Index สำหรับ source (เหมือนเดิม)
         logger.info(f"กำลังสร้าง Payload Index (Keyword) สำหรับ 'metadata.source'...")
         await asyncio.to_thread(
@@ -437,7 +405,6 @@ async def ensure_qdrant_collection(collection_name: str):
             field_name="metadata.loc.chunkIndex",
             field_schema=models.PayloadSchemaType.INTEGER
         )
-
         # สร้าง Index สำหรับ pageContent (Full-text search)
         logger.info(f"กำลังสร้าง Payload Index (Full-text) สำหรับ 'pageContent'...")
         await asyncio.to_thread(
@@ -453,7 +420,6 @@ async def ensure_qdrant_collection(collection_name: str):
             )
         )
         logger.info(f"สร้าง Payload Index ทั้งหมดสำหรับ collection '{collection_name}' สำเร็จแล้ว.")
-
 
 async def process_and_upsert_single_page(doc: fitz.Document, page_num: int, file_name: str, collection_name: str) -> Tuple[int, int]:
     global vision_model, semaphore_ocr_call, qdrant_client
@@ -498,14 +464,12 @@ async def process_and_upsert_single_page(doc: fitz.Document, page_num: int, file
     except Exception as e:
         logger.error(f"เกิดข้อผิดพลาดรุนแรงขณะประมวลผลหน้า {page_num}: {e}", exc_info=True)
         return 0, len(page_tasks)
-
 async def page_worker_with_semaphore(doc: fitz.Document, page_num: int, file_name: str, collection_name: str) -> Tuple[int, int]:
     global page_processing_semaphore
     if page_processing_semaphore is None:
         raise RuntimeError("Page processing semaphore is not initialized.")
     async with page_processing_semaphore:
         return await process_and_upsert_single_page(doc, page_num, file_name, collection_name)
-
 async def process_pdf_in_background(
     file_path_key: str,
     file_bytes: bytes,
@@ -532,7 +496,6 @@ async def process_pdf_in_background(
         existing_pages = await get_existing_page_numbers(collection_name, cleaned_source_name)
         if existing_pages:
             logger.info(f"[BG] พบหน้าที่ประมวลผลแล้วสำหรับไฟล์นี้: {sorted(list(existing_pages))}")
-
         doc = await asyncio.to_thread(fitz.open, stream=file_bytes, filetype="pdf")
         total_pages_in_doc = len(doc)
         
@@ -555,10 +518,8 @@ async def process_pdf_in_background(
             results = await asyncio.gather(*page_processing_tasks)
             doc.close()
             doc = None
-
             total_successful_chunks = sum(res[0] for res in results)
             total_failed_chunks = sum(res[1] for res in results)
-
             if total_successful_chunks > 0:
                 message = f"ประมวลผลและเพิ่ม {total_successful_chunks} chunks ใหม่ ลงใน Qdrant collection '{collection_name}' สำเร็จแล้ว"
                 status_code = "success"
@@ -568,7 +529,6 @@ async def process_pdf_in_background(
             final_response = ProcessingResponse(collection_name=collection_name, status=status_code, processed_chunks=total_successful_chunks, failed_chunks=total_failed_chunks, message=message, file_name=original_file_name)
         
         await update_job_status(file_path_key, "completed", {"result": json.loads(final_response.model_dump_json())})
-
     except Exception as e:
         logger.error(f"[BG Task] เกิดข้อผิดพลาดรุนแรงที่ไม่สามารถจัดการได้: {e}", exc_info=True)
         error_message = f"เกิดข้อผิดพลาดรุนแรงระหว่างการประมวลผล: {e}"
@@ -580,7 +540,6 @@ async def process_pdf_in_background(
             logger.info(f"[BG] ปิดเอกสาร '{original_file_name}' เรียบร้อยแล้ว")
         if final_response:
             await notify_webhook(final_response)
-
 # --- FastAPI Endpoints ---
 @app.post("/process_pdf/", response_model=AcknowledgementResponse, status_code=status.HTTP_202_ACCEPTED)
 async def process_pdf_file(background_tasks: BackgroundTasks, file: UploadFile = File(...), pages: Optional[str] = Form(None), collection_name: Optional[str] = Form(None)):
@@ -593,13 +552,11 @@ async def process_pdf_file(background_tasks: BackgroundTasks, file: UploadFile =
     background_tasks.add_task(process_pdf_in_background, file_path_key=file_path_key, file_bytes=file_bytes, file_name=file.filename, pages_str=pages, custom_collection_name=collection_name)
     
     return AcknowledgementResponse(message="Task accepted. Use the file_path to check status.", file_path=file_path_key, task_status="queued")
-
 @app.get("/collections/{collection_name}/sources", response_model=SourceListResponse)
 async def get_sources_in_collection(collection_name: str = Path(..., description="ชื่อของ Collection ที่ต้องการตรวจสอบ")):
     logger.info(f"ได้รับคำขอเพื่อ list sources ใน collection: '{collection_name}'")
     sources = await list_unique_sources_in_collection(collection_name)
     return SourceListResponse(collection_name=collection_name, source_count=len(sources), sources=sources)
-
 @app.post("/process_from_library/", response_model=AcknowledgementResponse, status_code=status.HTTP_202_ACCEPTED)
 async def process_from_library(request: LibrarySearchRequest, background_tasks: BackgroundTasks):
     logger.info(f"ได้รับคำขอจาก Library: '{request.query}', กำลังดาวน์โหลด...")
@@ -611,19 +568,15 @@ async def process_from_library(request: LibrarySearchRequest, background_tasks: 
     file_path_key = file_to_process.get('path')
     if not file_path_key:
         raise HTTPException(status_code=500, detail="ข้อมูลจาก Library API ไม่มี 'path' ของไฟล์")
-
     download_result = await download_book_from_library(file_path_key)
     if download_result is None:
         raise HTTPException(status_code=500, detail=f"ดาวน์โหลดไฟล์ '{file_path_key}' จาก Library ล้มเหลว")
-
     file_name, file_bytes = download_result
     
     await update_job_status(file_path_key, "queued", {"file_path": file_name})
     
     background_tasks.add_task(process_pdf_in_background, file_path_key=file_path_key, file_bytes=file_bytes, file_name=file_name, pages_str=request.pages, custom_collection_name=request.collection_name)
-
     return AcknowledgementResponse(message="Task accepted. Use the file_path to check status.", file_path=file_path_key, task_status="queued")
-
 @app.post("/process_by_path/", response_model=AcknowledgementResponse, status_code=status.HTTP_202_ACCEPTED)
 async def process_by_file_path(request: ProcessByPathRequest, background_tasks: BackgroundTasks):
     file_path_key = request.file_path
@@ -632,15 +585,12 @@ async def process_by_file_path(request: ProcessByPathRequest, background_tasks: 
     download_result = await download_book_from_library(file_path_key)
     if download_result is None:
         raise HTTPException(status_code=500, detail=f"ดาวน์โหลดไฟล์ '{file_path_key}' จาก Library ล้มเหลว")
-
     file_name, file_bytes = download_result
     
     await update_job_status(file_path_key, "queued", {"file_path": file_name})
     
     background_tasks.add_task(process_pdf_in_background, file_path_key=file_path_key, file_bytes=file_bytes, file_name=file_name, pages_str=request.pages, custom_collection_name=request.collection_name)
-
     return AcknowledgementResponse(message="Task accepted. Use the file_path to check status.", file_path=file_path_key, task_status="queued")
-
 @app.get("/status", response_model=JobStatusResponse)
 async def get_job_status(file_path: str = Query(..., description="File Path ที่ได้รับจากการส่งไฟล์ (ต้อง URL Encoded)")):
     statuses = await _read_job_statuses()
@@ -648,11 +598,9 @@ async def get_job_status(file_path: str = Query(..., description="File Path ท�
     if not job_details:
         raise HTTPException(status_code=404, detail=f"Status for file_path '{file_path}' not found.")
     return JobStatusResponse(file_path=file_path, details=job_details)
-
 @app.get("/")
 async def root():
     return {"message": "บริการประมวลผล PDF กำลังทำงาน. ใช้ /docs สำหรับเอกสาร API."}
-
 # --- Main Execution ---
 if __name__ == "__main__":
     if sys.version_info < (3, 8):
