@@ -21,3 +21,5 @@ job_status.json
 # OS
 .DS_Store
 Thumbs.db
+
+.pdf
