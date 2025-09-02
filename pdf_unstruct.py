@@ -1,64 +1,81 @@
 import os
-import asyncio
-import logging
 import sys
-import json
-import base64
-import hashlib
-from typing import List, Dict, Any, Optional, Tuple, Set, Union
-import uuid
-from datetime import datetime, timezone
-from contextlib import asynccontextmanager
 import io
 import re
-
+import json
+import uuid
+import base64
+import asyncio
+import logging
+import hashlib
+from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import urljoin
 # FastAPI
-from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form, Path, BackgroundTasks, Query
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    status,
+    UploadFile,
+    File,
+    Form,
+    Path,
+    BackgroundTasks,
+    Query,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-
-# Core Processing & External Libraries
+# External libraries
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
-
 import google.generativeai as genai
 from qdrant_client import QdrantClient, models
-from PIL import Image
+from PIL import Image, ImageDraw
 import httpx
 import aiofiles
-from urllib.parse import urljoin
 import aiohttp
 from unstructured.partition.pdf import partition_pdf
 from markdown_it import MarkdownIt
-
-# Optional: PyMuPDF for fast page counting
+# Optional: PyMuPDF (fitz) for fast rendering
 try:
-    import fitz
+    import fitz  # PyMuPDF
     _fitz_available = True
 except ImportError:
     _fitz_available = False
-    logging.warning("PyMuPDF (fitz) not installed. Page counting might be slower.")
-
-# Optional: pypdf as another fast fallback
+    logging.warning(
+        "PyMuPDF (fitz) not installed. Page rendering for Gemini OCR might be unavailable."
+    )
+# Optional: pypdf for fallback page count
 try:
     import pypdf
     _pypdf_available = True
 except ImportError:
     _pypdf_available = False
+# Optional: NumPy/OpenCV for adaptive figure expansion
+try:
+    import numpy as np
+    _np_available = True
+except Exception:
+    _np_available = False
+try:
+    import cv2
+    _cv2_available = True
+except Exception:
+    _cv2_available = False
 
-# --- Logging Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# -------------------- Logging --------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# --- Environment Variable Loading ---
-dotenv_path_key = os.path.join(os.path.dirname(__file__), 'key.env')
+# -------------------- Environment --------------------
+dotenv_path_key = os.path.join(os.path.dirname(__file__), "key.env")
 if os.path.exists(dotenv_path_key):
     load_dotenv(dotenv_path=dotenv_path_key)
     logger.info("โหลดตัวแปรสภาพแวดล้อมจาก key.env แล้ว")
-
 # API Keys and URLs
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
@@ -66,61 +83,87 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 LIBRARY_API_TOKEN = os.getenv("LIBRARY_API_TOKEN")
 LIBRARY_API_BASE_URL = os.getenv("LIBRARY_API_BASE_URL")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
-
-# --- Global Settings ---
+# Global Settings
 CONCURRENCY = int(os.getenv("CONCURRENCY", "2"))
 PAGE_CONCURRENCY = int(os.getenv("PAGE_CONCURRENCY", "2"))
 QDRANT_VECTOR_SIZE = int(os.getenv("QDRANT_VECTOR_SIZE", "1024"))
-
 OLLAMA_EMBEDDING_URL = os.getenv("OLLAMA_EMBEDDING_URL")
 OLLAMA_EMBEDDING_MODEL_NAME = os.getenv("OLLAMA_EMBEDDING_MODEL_NAME")
 FALLBACK_EMBEDDING_URL = os.getenv("FALLBACK_EMBEDDING_URL")
 FALLBACK_EMBEDDING_MODEL_NAME = os.getenv("FALLBACK_EMBEDDING_MODEL_NAME")
-
 OCR_LANGUAGES = [s.strip() for s in os.getenv("OCR_LANGUAGES", "eng").split(",") if s.strip()]
-INFER_TABLE_STRUCTURE = os.getenv("INFER_TABLE_STRUCTURE", "true").lower() in ("1","true","yes")
-
+INFER_TABLE_STRUCTURE = os.getenv("INFER_TABLE_STRUCTURE", "true").lower() in ("1", "true", "yes")
+OCR_MODE = os.getenv("OCR_MODE", "gemini").strip().lower()  # "unstructured" or "gemini"
+OCR_PAGE_DPI = int(os.getenv("OCR_PAGE_DPI", "600"))
 # Markdown export
 OCR_MD_OUTPUT_DIR = os.getenv("OCR_MD_OUTPUT_DIR", "ocr_md_outputs")
 SAVE_MD_ENABLED = os.getenv("SAVE_MD_ENABLED", "true").lower() in ("1", "true", "yes")
 os.makedirs(OCR_MD_OUTPUT_DIR, exist_ok=True)
-
-# Rebuild Markdown for whole document with structure heuristics
+# Rebuild Markdown for whole doc with structure heuristics
 MD_REBUILD_WHOLEDOC = os.getenv("MD_REBUILD_WHOLEDOC", "true").lower() in ("1", "true", "yes")
-MD_CLI_HINTS = [s.strip() for s in os.getenv(
-    "MD_CLI_HINTS",
-    "kubectl,docker,git,pip,npm,helm,aws,az,gcloud,psql,redis-cli,curl,wget,python,node,go,java,php,perl,ruby,bash,sh,powershell,terraform,ansible,ffmpeg,ffprobe,scp,ssh,rsync,sqlcmd,psql,mongo,mysql"
-).split(",") if s.strip()]
-
-# --- Large PDF / Batch Mode (เหมาะกับสแกน/รูป/ตารางเยอะ) ---
+MD_CLI_HINTS = [
+    s.strip()
+    for s in os.getenv(
+        "MD_CLI_HINTS",
+        "kubectl,docker,git,pip,npm,helm,aws,az,gcloud,psql,redis-cli,curl,wget,python,node,go,java,php,perl,ruby,bash,sh,powershell,terraform,ansible,ffmpeg,ffprobe,scp,ssh,rsync,sqlcmd,psql,mongo,mysql",
+    ).split(",")
+    if s.strip()
+]
+# Large PDF / Batch Mode
 LARGE_PDF_MODE = os.getenv("LARGE_PDF_MODE", "true").lower() in ("1", "true", "yes")
 BATCH_PAGE_SIZE = int(os.getenv("BATCH_PAGE_SIZE", "30"))
-PREVIEW_TABLES = os.getenv("PREVIEW_TABLES", "true").lower() in ("1","true","yes")
-
-# --- Gemini for Markdown post-process (optional) ---
-USE_GEMINI_MD = os.getenv("USE_GEMINI_MD", "false").lower() in ("1","true","yes")
-GEMINI_MD_MODEL = os.getenv("GEMINI_MD_MODEL", "gemini-2.0-flash")
+PREVIEW_TABLES = os.getenv("PREVIEW_TABLES", "true").lower() in ("1", "true", "yes")
+# Inline image placement for Gemini OCR mode
+OCR_INLINE_IMAGE = os.getenv("OCR_INLINE_IMAGE", "true").lower() in ("1", "true", "yes")
+OCR_IMAGE_PADDING_PX = int(os.getenv("OCR_IMAGE_PADDING_PX", "16"))
+OCR_MIN_BAND_HEIGHT_PX = int(os.getenv("OCR_MIN_BAND_HEIGHT_PX", "32"))
+# hi-res figure padding
+HIRES_IMG_PAD_PX = int(os.getenv("HIRES_IMG_PAD_PX", "24"))
+HIRES_IMG_PAD_PCT = float(os.getenv("HIRES_IMG_PAD_PCT", "0.03"))
+HI_RES_MODEL_NAME = os.getenv("UNSTRUCTURED_HI_RES_MODEL_NAME", "").strip() or None
+logger.info(f"HI_RES_MODEL_NAME={HI_RES_MODEL_NAME or 'default'}")
+# Adaptive figure expansion (new)
+FIGURE_AUTO_EXPAND = os.getenv("FIGURE_AUTO_EXPAND", "true").lower() in ("1", "true", "yes")
+FIGURE_MAX_GROWTH_PX = int(os.getenv("FIGURE_MAX_GROWTH_PX", "160"))
+FIGURE_GROW_STEP_PX = int(os.getenv("FIGURE_GROW_STEP_PX", "16"))
+FIGURE_EDGE_INK_RATIO = float(os.getenv("FIGURE_EDGE_INK_RATIO", "0.025"))
+FIGURE_OVERLAP_IOU = float(os.getenv("FIGURE_OVERLAP_IOU", "0.15"))
+# Gemini for Markdown post-process (optional)
+USE_GEMINI_MD = os.getenv("USE_GEMINI_MD")
+GEMINI_MD_MODEL = os.getenv("GEMINI_MD_MODEL", "gemini-2.5-flash")
 GEMINI_MD_TEMPERATURE = float(os.getenv("GEMINI_MD_TEMPERATURE", "0.0"))
 GEMINI_MD_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MD_MAX_OUTPUT_TOKENS", "8192"))
-
+GEMINI_MD_POLICY = os.getenv("GEMINI_MD_POLICY", "correct").strip().lower()
+if GEMINI_MD_POLICY not in ("correct", "format"):
+    GEMINI_MD_POLICY = "correct"
+GEMINI_MD_LANG_HINT = os.getenv(
+    "GEMINI_MD_LANG_HINT",
+    "Thai and English business/technical document; keep headings '## Page N', tables, code, and images unchanged.",
+)
 # Toggle for image caption cost control
-USE_GEMINI_CAPTION = os.getenv("USE_GEMINI_CAPTION", "true").lower() in ("1","true","yes")
-
+USE_GEMINI_CAPTION = os.getenv("USE_GEMINI_CAPTION", "true").lower() in ("1", "true", "yes")
+# Job status file
 JOB_STATUS_FILE = os.path.join(OCR_MD_OUTPUT_DIR, "job_status.json")
 job_status_lock = asyncio.Lock()
-
-# --- Idle Monitor Settings ---
+# Idle monitor
 IDLE_THRESHOLD_SECONDS = int(os.getenv("IDLE_THRESHOLD_SECONDS", "1800"))
 IDLE_CHECK_INTERVAL_SECONDS = int(os.getenv("IDLE_CHECK_INTERVAL_SECONDS", "60"))
 LAST_ACTIVITY_AT = datetime.now(timezone.utc)
 last_activity_lock = asyncio.Lock()
 idle_notified = False
 idle_watchdog_task: Optional[asyncio.Task] = None
-
-# --- Gemini Prompts ---
-IMAGE_CAPTION_PROMPT = "Describe this image for a search index. What key information does it contain? Be concise and informative, focusing on data and relationships shown."
-
-# --- Global Client Instances ---
+# Gemini prompts
+IMAGE_CAPTION_PROMPT = (
+    "Describe this image for a search index. What key information does it contain? "
+    "Be concise and informative, focusing on data and relationships shown."
+)
+OCR_PAGE_PROMPT = """You are an expert OCR and Markdown formatter.
+Transcribe ONLY textual content visible in this page image into clean Markdown.
+Do NOT describe or include images. Do NOT invent content.
+Preserve headings, lists, tables (use Markdown tables), and code fences. Keep numbers/dates/units unchanged.
+Return Markdown only.
+"""
+# Global client instances
 vision_model: Optional[genai.GenerativeModel] = None
 md_model: Optional[genai.GenerativeModel] = None
 qdrant_client: Optional[QdrantClient] = None
@@ -128,7 +171,7 @@ semaphore_embedding_call: Optional[asyncio.Semaphore] = None
 page_processing_semaphore: Optional[asyncio.Semaphore] = None
 embedding_http_session: Optional[aiohttp.ClientSession] = None
 
-# --- Pydantic Models ---
+# -------------------- Pydantic Models --------------------
 class ProcessingResponse(BaseModel):
     collection_name: str
     status: str
@@ -180,16 +223,40 @@ class CleanupByBookIdResponse(BaseModel):
     dry_run: bool
     details: List[Dict[str, Any]]
 
-# ---------- Helpers ----------
+# -------------------- Small helpers --------------------
 def _safe_filename(name: str) -> str:
     keep = "-_.() []"
     cleaned = "".join(c for c in (name or "") if c.isalnum() or c in keep).strip()
     return cleaned or f"doc_{uuid.uuid4().hex}"
 
 def _chunk_list(items: List[int], n: int) -> List[List[int]]:
-    return [items[i:i+n] for i in range(0, len(items), n)]
+    return [items[i : i + n] for i in range(0, len(items), n)]
 
-# ---------- Activity & Idle ----------
+def split_md_into_chunks(md_text: str, max_len: int = 1200) -> List[str]:
+    lines = (md_text or "").splitlines()
+    chunks, cur = [], []
+    cur_len = 0
+    for ln in lines:
+        add = len(ln) + 1
+        if cur_len + add > max_len and cur:
+            chunks.append("\n".join(cur).strip())
+            cur, cur_len = [ln], add
+        else:
+            cur.append(ln)
+            cur_len += add
+    if cur:
+        chunks.append("\n".join(cur).strip())
+    return [c for c in chunks if c]
+
+def make_anchor(s: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9\- ]+", "", s).strip().lower().replace(" ", "-")
+    return s or f"section-{uuid.uuid4().hex[:8]}"
+
+def fence(content: str, lang: str = "") -> str:
+    content = (content or "").strip("\n")
+    return f"```{lang}\n{content}\n```" if lang else f"```\n{content}\n```"
+
+# -------------------- Activity & Idle --------------------
 async def mark_activity(source: str = ""):
     global LAST_ACTIVITY_AT, idle_notified
     async with last_activity_lock:
@@ -203,7 +270,7 @@ async def notify_startup():
     payload = {
         "status": "online",
         "message": "PDF Processing Service has started successfully.",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -219,7 +286,7 @@ async def notify_idle(idle_seconds: int):
     payload = {
         "status": "idle",
         "message": f"Service has been idle for {idle_seconds} seconds.",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -249,7 +316,90 @@ async def idle_watchdog():
         except Exception as e:
             logger.error(f"[Idle] Idle watchdog error: {e}", exc_info=True)
 
-# ---------- Unstructured helpers ----------
+# -------------------- Text cleanup --------------------
+def fix_joined_words(t: str) -> str:
+    if not t:
+        return t
+    t = re.sub(r"([a-z0-9\)\]])([A-Z])", r"\1 \2", t)
+    t = re.sub(r":(?!\s)", ": ", t)
+    t = re.sub(r"\s+([,.;:])", r"\1", t)
+    return t
+
+def dehyphenate_wraps(text: str) -> str:
+    return re.sub(r"(?<=\w)-\s+(?=\w)", "", text or "")
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\u2013", "-").replace("\u2014", "-")
+    t = dehyphenate_wraps(t)
+    t = fix_joined_words(t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\s+\n", "\n", t).strip()
+    return t
+
+def token_ratio(s: str, chars: str = r"\-\[\]\{\}\(\)=_/\\\|\$><;,:") -> float:
+    if not s:
+        return 0.0
+    hits = sum(1 for ch in s if re.search(f"[{re.escape(chars)}]", ch))
+    return hits / len(s)
+
+def looks_jsonish(s: str) -> bool:
+    if not s:
+        return False
+    t = s.strip()
+    if not t:
+        return False
+    if t[0] in "{[":
+        try:
+            json.loads(t)
+            return True
+        except Exception:
+            return (t.count(":") >= 2) and any(ch in t for ch in "{}[]")
+    return (t.count(":") >= 2) and any(ch in t for ch in "{}[]")
+
+def guess_code_lang(s: str) -> str:
+    t = (s or "").strip()
+    if looks_jsonish(t):
+        return "json"
+    if re.search(r"^\s*(SELECT|WITH|INSERT|UPDATE|DELETE)\b", t, re.I):
+        return "sql"
+    if re.search(r"\b(def|import|from|class|print\()", t):
+        return "python"
+    if re.search(r"\b(const|let|var|function)\b|\bconsole\.log\(", t):
+        return "javascript"
+    if re.search(r"\bpackage\s+main\b|\bfunc\s+\w+\(", t):
+        return "go"
+    if re.search(r"^\s*(curl|wget|sudo|export|echo|cd|ls|cat|grep|awk|sed|tar|zip)\b", t):
+        return "bash"
+    if re.search(
+        r"^\s*(kubectl|docker|helm|aws|az|gcloud|git|pip|npm|node|python|java|php|perl|ruby|psql|redis-cli)\b",
+        t,
+        re.I,
+    ):
+        return "bash"
+    if re.search(r"^\s*Set-Item|Get-Item|Write-Host|Get-ChildItem\b", t):
+        return "powershell"
+    return ""
+
+def is_cli_command_line(s: str) -> bool:
+    if not s:
+        return False
+    t = s.strip()
+    if re.search(r"\s--?\w+", t) or re.search(r"[/\\][\w\-/\.]+", t) or re.search(r"[|><]{1,2}", t):
+        return True
+    first = t.split()[0] if t.split() else ""
+    if first.lower() in [h.lower() for h in MD_CLI_HINTS]:
+        return True
+    if re.search(r"[\[\{].+[\]\}]", t) and "=" in t:
+        return True
+    if re.search(r"\s\d+$", t):
+        return True
+    if token_ratio(t) > 0.12 and len(t) <= 180:
+        return True
+    return False
+
+# -------------------- Unstructured helpers --------------------
 def parse_markdown_table(md_text: str) -> list[dict]:
     if not md_text or not isinstance(md_text, str):
         return []
@@ -258,20 +408,20 @@ def parse_markdown_table(md_text: str) -> list[dict]:
         tokens = md.parse(md_text)
         header, rows, in_tbody = [], [], False
         for i, token in enumerate(tokens):
-            if token.type == 'th_open' and (i + 1 < len(tokens)) and tokens[i+1].type == 'inline':
-                header.append(tokens[i+1].content)
-            if token.type == 'tbody_open':
+            if token.type == "th_open" and (i + 1 < len(tokens)) and tokens[i + 1].type == "inline":
+                header.append(tokens[i + 1].content)
+            if token.type == "tbody_open":
                 in_tbody = True
-            if token.type == 'tr_open' and in_tbody:
+            if token.type == "tr_open" and in_tbody:
                 close_tr_index = -1
                 for j in range(i + 1, len(tokens)):
-                    if tokens[j].type == 'tr_close':
+                    if tokens[j].type == "tr_close":
                         close_tr_index = j
                         break
                 if close_tr_index == -1:
                     continue
-                row_tokens = tokens[i+1: close_tr_index]
-                cell_contents = [t.content for t in row_tokens if t.type == 'inline']
+                row_tokens = tokens[i + 1 : close_tr_index]
+                cell_contents = [t.content for t in row_tokens if t.type == "inline"]
                 current_row = {h: cell for h, cell in zip(header, cell_contents)}
                 if current_row:
                     rows.append(current_row)
@@ -316,41 +466,6 @@ def make_chunk_id(meta: Dict[str, Any], text: Optional[str] = None) -> str:
     seed = json.dumps(base, sort_keys=True, ensure_ascii=False)
     return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
-# -------- Text cleanup and noise --------
-def fix_joined_words(t: str) -> str:
-    if not t:
-        return t
-    t = re.sub(r'([a-z0-9\)\]])([A-Z])', r'\1 \2', t)
-    t = re.sub(r':(?!\s)', ': ', t)
-    t = re.sub(r'\s+([,.;:])', r'\1', t)
-    return t
-
-def dehyphenate_wraps(text: str) -> str:
-    return re.sub(r'(?<=\w)-\s+(?=\w)', '', text or "")
-
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    t = text.replace("\u2013", "-").replace("\u2014", "-")
-    t = dehyphenate_wraps(t)
-    t = fix_joined_words(t)
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\s+\n", "\n", t).strip()
-    return t
-
-def is_noise(el) -> bool:
-    cat = getattr(el, "category", "")
-    txt = (getattr(el, "text", "") or "").strip()
-    if not txt:
-        return True
-    if cat in {"UncategorizedText", "PageBreak"}:
-        return True
-    alnum_ratio = sum(ch.isalnum() for ch in txt) / max(len(txt), 1)
-    if alnum_ratio < 0.15:
-        return True
-    return False
-
-# -------- Coordinates & reading order --------
 def _coord_values(el) -> Optional[Dict[str, float]]:
     try:
         md = el.metadata.to_dict() if getattr(el, "metadata", None) else {}
@@ -362,13 +477,22 @@ def _coord_values(el) -> Optional[Dict[str, float]]:
                 xs.append(float(p.get("x", 0.0)))
                 ys.append(float(p.get("y", 0.0)))
             elif isinstance(p, (list, tuple)) and len(p) >= 2:
-                xs.append(float(p[0])); ys.append(float(p[1]))
+                xs.append(float(p[0]))
+                ys.append(float(p[1]))
         if not xs or not ys:
             return None
         layout_w = float(coords.get("layout_width") or 0.0)
         layout_h = float(coords.get("layout_height") or 0.0)
-        info = {"min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys), "W": layout_w, "H": layout_h}
-        if layout_w > 0: info["nx"] = info["min_x"] / layout_w
+        info = {
+            "min_x": min(xs),
+            "max_x": max(xs),
+            "min_y": min(ys),
+            "max_y": max(ys),
+            "W": layout_w,
+            "H": layout_h,
+        }
+        if layout_w > 0:
+            info["nx"] = info["min_x"] / layout_w
         if layout_h > 0:
             info["ny_top"] = info["min_y"] / layout_h
             info["ny_bot"] = info["max_y"] / layout_h
@@ -414,86 +538,6 @@ def is_header_footer(el, header_thresh: float = 0.06, footer_thresh: float = 0.9
         return True
     return False
 
-# -------- Code/JSON detection --------
-def token_ratio(s: str, chars: str = r'\-\[\]\{\}\(\)=_/\\\|\$><;,:') -> float:
-    if not s: return 0.0
-    hits = sum(1 for ch in s if re.search(f"[{re.escape(chars)}]", ch))
-    return hits / len(s)
-
-def looks_jsonish(s: str) -> bool:
-    if not s: return False
-    t = s.strip()
-    if not t: return False
-    if t[0] in "{[":
-        try:
-            json.loads(t)
-            return True
-        except Exception:
-            return (t.count(":") >= 2) and any(ch in t for ch in "{}[]")
-    return (t.count(":") >= 2) and any(ch in t for ch in "{}[]")
-
-def guess_code_lang(s: str) -> str:
-    t = s.strip()
-    if looks_jsonish(t): return "json"
-    if re.search(r'^\s*(SELECT|WITH|INSERT|UPDATE|DELETE)\b', t, re.I): return "sql"
-    if re.search(r'\b(def|import|from|class|print\()', t): return "python"
-    if re.search(r'\b(const|let|var|function)\b|\bconsole\.log\(', t): return "javascript"
-    if re.search(r'\bpackage\s+main\b|\bfunc\s+\w+\(', t): return "go"
-    if re.search(r'^\s*(curl|wget|sudo|export|echo|cd|ls|cat|grep|awk|sed|tar|zip)\b', t): return "bash"
-    if re.search(r'^\s*(kubectl|docker|helm|aws|az|gcloud|git|pip|npm|node|python|java|php|perl|ruby|psql|redis-cli)\b', t, re.I): return "bash"
-    if re.search(r'^\s*Set-Item|Get-Item|Write-Host|Get-ChildItem\b', t): return "powershell"
-    return ""
-
-def is_cli_command_line(s: str) -> bool:
-    if not s: return False
-    t = s.strip()
-    if re.search(r'\s--?\w+', t) or re.search(r'[/\\][\w\-/\.]+', t) or re.search(r'[|><]{1,2}', t):
-        return True
-    first = t.split()[0] if t.split() else ""
-    if first.lower() in [h.lower() for h in MD_CLI_HINTS]:
-        return True
-    if re.search(r'[\[\{].+[\]\}]', t) and "=" in t:
-        return True
-    if re.search(r'\s\d+$', t):
-        return True
-    if token_ratio(t) > 0.12 and len(t) <= 180:
-        return True
-    return False
-
-def is_commandish_title(txt: str) -> bool:
-    s = txt.strip()
-    if not s: return False
-    if (("[" in s and "]" in s) or ("(" in s and ")" in s)) and (re.search(r'--?\w+', s) or "=" in s):
-        return True
-    if re.match(r'^[a-z0-9][\w\-]*(\s+[\w\-/\[\]\(\)=\.:]+)+$', s):
-        return True
-    return False
-
-def fence(content: str, lang: str = "") -> str:
-    content = (content or "").strip("\n")
-    return f"```{lang}\n{content}\n```" if lang else f"```\n{content}\n```"
-
-def make_anchor(s: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9\- ]+", "", s).strip().lower()
-    s = s.replace(" ", "-")
-    return s or f"section-{uuid.uuid4().hex[:8]}"
-
-def detect_document_title(elements: List[Any], fallback: str) -> str:
-    candidates = []
-    for el in elements:
-        if getattr(el, "category", "") == "Title" and (_elem_page_number(el) or 1) == 1:
-            txt = clean_text(getattr(el, "text", "") or "")
-            if not txt: continue
-            cv = _coord_values(el) or {}
-            ny_top = cv.get("ny_top", 1.0)
-            upper_ratio = (sum(ch.isupper() for ch in txt if ch.isalpha()) / max(1, sum(ch.isalpha() for ch in txt)))
-            score = (1.0 - min(ny_top, 1.0)) + upper_ratio + min(len(txt), 120) / 120.0
-            candidates.append((score, txt))
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
-    return fallback
-
 def render_table(el) -> str:
     md = el.metadata.to_dict() if getattr(el, "metadata", None) else {}
     html = md.get("text_as_html")
@@ -524,10 +568,229 @@ def render_image(el, image_output_dir: str) -> str:
             return ""
     return ""
 
+def is_commandish_title(txt: str) -> bool:
+    s = txt.strip()
+    if not s:
+        return False
+    if (("[" in s and "]" in s) or ("(" in s and ")")) and (re.search(r"--?\w+", s) or "=" in s):
+        return True
+    if re.match(r"^[a-z0-9][\w\-]*(\s+[\w\-/\[\]\(\)=\.:]+)+$", s):
+        return True
+    return False
+
+def detect_document_title(elements: List[Any], fallback: str) -> str:
+    candidates = []
+    for el in elements:
+        if getattr(el, "category", "") == "Title" and (_elem_page_number(el) or 1) == 1:
+            txt = clean_text(getattr(el, "text", "") or "")
+            if not txt:
+                continue
+            cv = _coord_values(el) or {}
+            ny_top = cv.get("ny_top", 1.0)
+            upper_ratio = (
+                sum(ch.isupper() for ch in txt if ch.isalpha()) / max(1, sum(ch.isalpha() for ch in txt))
+            )
+            score = (1.0 - min(ny_top, 1.0)) + upper_ratio + min(len(txt), 120) / 120.0
+            candidates.append((score, txt))
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    return fallback
+
+# -------------------- Coordinates & rendering --------------------
+def layout_rect_to_pixels(r: Dict[str, Any], img_w: int, img_h: int) -> Optional[Tuple[int, int, int, int]]:
+    W, H = float(r.get("W") or 0), float(r.get("H") or 0)
+    if W <= 0 or H <= 0:
+        return None
+    sx, sy = img_w / W, img_h / H
+    x0 = max(0, int(r["min_x"] * sx))
+    y0 = max(0, int(r["min_y"] * sy))
+    x1 = min(img_w, int(r["max_x"] * sx))
+    y1 = min(img_h, int(r["max_y"] * sy))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+def expand_rect_px(
+    rect_px: Tuple[int, int, int, int],
+    img_w: int,
+    img_h: int,
+    pad_px: int = HIRES_IMG_PAD_PX,
+    pad_pct: float = HIRES_IMG_PAD_PCT,
+) -> Tuple[int, int, int, int]:
+    pad = max(pad_px, int(min(img_w, img_h) * pad_pct))
+    x0, y0, x1, y1 = rect_px
+    ex0 = max(0, x0 - pad)
+    ey0 = max(0, y0 - pad)
+    ex1 = min(img_w, x1 + pad)
+    ey1 = min(img_h, y1 + pad)
+    if ex1 <= ex0 or ey1 <= ey0:
+        return rect_px
+    return (ex0, ey0, ex1, ey1)
+
+def render_page_to_image(file_bytes: bytes, page_number: int, dpi: int = OCR_PAGE_DPI) -> Image.Image:
+    if not _fitz_available:
+        raise RuntimeError("PyMuPDF (fitz) is required for Gemini OCR mode (page rendering).")
+    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+        if not (1 <= page_number <= len(doc)):
+            raise ValueError(f"page {page_number} out of range")
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = doc[page_number - 1].get_pixmap(matrix=mat, alpha=False)
+        return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+
+# -------- Adaptive figure expansion helpers (NEW) --------
+def _clip_rect(rect: Tuple[int, int, int, int], W: int, H: int) -> Tuple[int, int, int, int]:
+    x0, y0, x1, y1 = rect
+    x0 = max(0, min(x0, W - 1))
+    x1 = max(0, min(x1, W))
+    y0 = max(0, min(y0, H - 1))
+    y1 = max(0, min(y1, H))
+    if x1 <= x0:
+        x1 = min(W, x0 + 1)
+    if y1 <= y0:
+        y1 = min(H, y0 + 1)
+    return (x0, y0, x1, y1)
+
+def _to_gray_np(pil_img: Image.Image) -> "np.ndarray":
+    return np.array(pil_img.convert("L"))
+
+def _binarize(gray: "np.ndarray") -> "np.ndarray":
+    if _cv2_available:
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        return th > 0
+    else:
+        th = 200
+        return (255 - gray) > (255 - th)
+
+def _ink_ratio_band(bin_mask: "np.ndarray", rect: Tuple[int, int, int, int], side: str, band: int = 8) -> float:
+    x0, y0, x1, y1 = rect
+    H, W = bin_mask.shape
+    if side == "top":
+        y0b, y1b = max(0, y0 - band), y0
+        xs, ys = slice(x0, x1), slice(y0b, y1b)
+    elif side == "bottom":
+        y0b, y1b = y1, min(H, y1 + band)
+        xs, ys = slice(x0, x1), slice(y0b, y1b)
+    elif side == "left":
+        x0b, x1b = max(0, x0 - band), x0
+        xs, ys = slice(x0b, x1b), slice(y0, y1)
+    else:  # right
+        x0b, x1b = x1, min(W, x1 + band)
+        xs, ys = slice(x0b, x1b), slice(y0, y1)
+    region = bin_mask[ys, xs]
+    if region.size == 0:
+        return 0.0
+    return float(region.mean())
+
+def expand_rect_adaptive(
+    page_img: Image.Image,
+    rect_px: Tuple[int, int, int, int],
+    max_growth_px: int = FIGURE_MAX_GROWTH_PX,
+    step_px: int = FIGURE_GROW_STEP_PX,
+    edge_thresh: float = FIGURE_EDGE_INK_RATIO,
+) -> Tuple[int, int, int, int]:
+    if not _np_available:
+        return rect_px
+    W, H = page_img.size
+    rect = _clip_rect(rect_px, W, H)
+    gray = _to_gray_np(page_img)
+    bin_mask = _binarize(gray)
+    grown = 0
+    while grown < max_growth_px:
+        x0, y0, x1, y1 = rect
+        top_ratio = _ink_ratio_band(bin_mask, rect, "top", band=max(6, step_px // 2))
+        bottom_ratio = _ink_ratio_band(bin_mask, rect, "bottom", band=max(6, step_px // 2))
+        left_ratio = _ink_ratio_band(bin_mask, rect, "left", band=max(6, step_px // 2))
+        right_ratio = _ink_ratio_band(bin_mask, rect, "right", band=max(6, step_px // 2))
+        grown_this_round = False
+        if top_ratio > edge_thresh and y0 > 0:
+            y0 = max(0, y0 - step_px); grown_this_round = True
+        if bottom_ratio > edge_thresh and y1 < H:
+            y1 = min(H, y1 + step_px); grown_this_round = True
+        if left_ratio > edge_thresh and x0 > 0:
+            x0 = max(0, x0 - step_px); grown_this_round = True
+        if right_ratio > edge_thresh and x1 < W:
+            x1 = min(W, x1 + step_px); grown_this_round = True
+        new_rect = _clip_rect((x0, y0, x1, y1), W, H)
+        if not grown_this_round:
+            break
+        rect = new_rect
+        grown += step_px
+    return rect
+
+def rect_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    inter = iw * ih
+    area_a = max(0, ax1 - ax0) * max(0, ay1 - ay0)
+    area_b = max(0, bx1 - bx0) * max(0, by1 - by0)
+    union = area_a + area_b - inter if (area_a + area_b - inter) > 0 else 1
+    return inter / union
+
+def merge_overlapping_rects(rects: List[Tuple[int,int,int,int]], iou_thr: float = FIGURE_OVERLAP_IOU) -> List[Tuple[int,int,int,int]]:
+    rects = rects[:]
+    merged = True
+    while merged and len(rects) > 1:
+        merged = False
+        out = []
+        used = [False]*len(rects)
+        for i in range(len(rects)):
+            if used[i]: 
+                continue
+            a = rects[i]
+            for j in range(i+1, len(rects)):
+                if used[j]: 
+                    continue
+                b = rects[j]
+                if rect_iou(a, b) >= iou_thr:
+                    x0 = min(a[0], b[0]); y0 = min(a[1], b[1]); x1 = max(a[2], b[2]); y1 = max(a[3], b[3])
+                    a = (x0, y0, x1, y1)
+                    used[j] = True
+                    merged = True
+            out.append(a)
+            used[i] = True
+        rects = out
+    return rects
+# ----------------------------------------------------------
+
+def mask_image_regions_with_padding(page_img: Image.Image, rects_layout: List[Dict[str, Any]]) -> Image.Image:
+    out = page_img.copy()
+    draw = ImageDraw.Draw(out)
+    W, H = out.size
+    px_rects: List[Tuple[int,int,int,int]] = []
+    for r in rects_layout:
+        rect_px = r.get("rect_px")
+        if not rect_px:
+            rect_px = layout_rect_to_pixels(r, W, H)
+            if not rect_px:
+                continue
+            rect_px = expand_rect_px(rect_px, W, H)
+            if FIGURE_AUTO_EXPAND:
+                rect_px = expand_rect_adaptive(page_img, rect_px,
+                                               max_growth_px=FIGURE_MAX_GROWTH_PX,
+                                               step_px=FIGURE_GROW_STEP_PX,
+                                               edge_thresh=FIGURE_EDGE_INK_RATIO)
+        px_rects.append(rect_px)
+    # รวมกรอบก่อนมาสก์
+    px_rects = merge_overlapping_rects(px_rects, iou_thr=FIGURE_OVERLAP_IOU)
+    for rect in px_rects:
+        draw.rectangle(rect, fill="white")
+    return out
+
+async def gemini_ocr_text_from_masked_page(masked_page_image: Image.Image) -> str:
+    global vision_model
+    prompt = [OCR_PAGE_PROMPT, masked_page_image]
+    resp = await asyncio.to_thread(vision_model.generate_content, prompt)
+    text = (resp.text or "").strip()
+    return text + ("\n```" if text.count("```") % 2 == 1 else "")
+
+# -------------------- Markdown rebuild (optional) --------------------
 def group_sections_by_title(elements: List[Any], image_output_dir: str) -> List[Dict[str, Any]]:
     sections: List[Dict[str, Any]] = []
     current = {"title": None, "blocks": []}
-
     def push_current():
         nonlocal current
         if current["title"] or current["blocks"]:
@@ -546,7 +809,8 @@ def group_sections_by_title(elements: List[Any], image_output_dir: str) -> List[
                 else:
                     if code_acc:
                         code_acc["content"] = "\n".join(code_acc["content"])
-                        merged.append(code_acc); code_acc = None
+                        merged.append(code_acc)
+                        code_acc = None
                     merged.append(b)
             if code_acc:
                 code_acc["content"] = "\n".join(code_acc["content"])
@@ -554,52 +818,44 @@ def group_sections_by_title(elements: List[Any], image_output_dir: str) -> List[
             current["blocks"] = merged
             sections.append(current)
         current = {"title": None, "blocks": []}
-
     list_buffer: List[str] = []
     def flush_list():
         nonlocal list_buffer
         if list_buffer:
             current["blocks"].append({"type": "ul", "content": list_buffer[:]})
             list_buffer = []
-
     for el in elements:
-        if is_noise(el) or is_header_footer(el):
+        if is_header_footer(el) or clean_text(getattr(el, "text", "") or "") == "":
             continue
         cat = getattr(el, "category", "")
         raw = getattr(el, "text", "") or ""
         txt = clean_text(raw)
-        if not txt:
+        if not txt and cat not in {"Image", "Figure", "Table"}:
             continue
-
         if cat == "Title" and is_commandish_title(txt):
             flush_list()
             current["blocks"].append({"type": "code", "lang": guess_code_lang(txt) or "bash", "content": txt})
             continue
-
         if cat == "Title":
             flush_list()
             push_current()
             current["title"] = txt
             continue
-
         if cat == "ListItem":
             list_buffer.append(txt)
             continue
-
         if cat == "Table":
             flush_list()
             table_md = render_table(el)
             if table_md:
                 current["blocks"].append({"type": "table", "content": table_md})
             continue
-
         if cat in {"Image", "Figure"}:
             flush_list()
             img_md = render_image(el, image_output_dir)
             if img_md:
                 current["blocks"].append({"type": "img", "content": img_md})
             continue
-
         flush_list()
         if looks_jsonish(txt):
             current["blocks"].append({"type": "code", "lang": "json", "content": txt})
@@ -607,7 +863,6 @@ def group_sections_by_title(elements: List[Any], image_output_dir: str) -> List[
             current["blocks"].append({"type": "code", "lang": guess_code_lang(txt) or "bash", "content": txt})
         else:
             current["blocks"].append({"type": "p", "content": txt})
-
     flush_list()
     push_current()
     return sections
@@ -633,27 +888,20 @@ async def rebuild_markdown_whole_doc(
     except Exception as e:
         logger.warning(f"[MD Rebuild] partition_pdf ล้มเหลว จะ fallback per-page: {e}")
         return ""
-
     doc_elements = sort_by_reading_order(doc_elements)
-
     doc_title = detect_document_title(doc_elements, fallback=(source_label or "Document"))
     lines: List[str] = [f"# {doc_title}", ""]
-
     pages: Dict[int, List[Any]] = {}
     for el in doc_elements:
         pn = _elem_page_number(el) or 1
         pages.setdefault(pn, []).append(el)
-
     for pn in sorted(p for p in pages.keys() if p in set(pages_to_iterate)):
-        page_els = [el for el in pages[pn] if not (is_noise(el) or is_header_footer(el))]
+        page_els = [el for el in pages[pn] if not (is_header_footer(el))]
         page_els = sort_by_reading_order(page_els)
-
         lines.append(f"## Page {pn}")
         lines.append("")
-
         para_buf: List[str] = []
         list_buf: List[str] = []
-
         def flush_paragraph():
             nonlocal para_buf
             if para_buf:
@@ -662,7 +910,6 @@ async def rebuild_markdown_whole_doc(
                     lines.append(paragraph)
                     lines.append("")
             para_buf = []
-
         def flush_list():
             nonlocal list_buf
             if list_buf:
@@ -670,17 +917,15 @@ async def rebuild_markdown_whole_doc(
                     lines.append(f"- {clean_text(li)}")
                 lines.append("")
             list_buf = []
-
         for el in page_els:
             cat = getattr(el, "category", "")
             raw = getattr(el, "text", "") or ""
             txt = clean_text(raw)
-
             if not txt and cat not in {"Image", "Figure", "Table"}:
                 continue
-
             if cat == "Title":
-                flush_paragraph(); flush_list()
+                flush_paragraph()
+                flush_list()
                 if is_commandish_title(txt):
                     lines.append(fence(txt, guess_code_lang(txt) or "bash"))
                     lines.append("")
@@ -688,46 +933,47 @@ async def rebuild_markdown_whole_doc(
                     lines.append(f"## {txt}")
                     lines.append("")
                 continue
-
             if cat == "ListItem":
                 flush_paragraph()
                 if txt:
                     list_buf.append(txt)
                 continue
-
             if cat == "Table":
-                flush_paragraph(); flush_list()
+                flush_paragraph()
+                flush_list()
                 tbl = render_table(el)
                 if tbl:
-                    lines.append(tbl); lines.append("")
+                    lines.append(tbl)
+                    lines.append("")
                 continue
-
             if cat in {"Image", "Figure"}:
-                flush_paragraph(); flush_list()
+                flush_paragraph()
+                flush_list()
                 img_md = render_image(el, image_output_dir)
                 if img_md:
-                    lines.append(img_md); lines.append("")
+                    lines.append(img_md)
+                    lines.append("")
                 continue
-
             if looks_jsonish(txt):
-                flush_paragraph(); flush_list()
-                lines.append(fence(txt, "json")); lines.append("")
+                flush_paragraph()
+                flush_list()
+                lines.append(fence(txt, "json"))
+                lines.append("")
                 continue
-
             if is_cli_command_line(txt) or token_ratio(txt) > 0.18:
-                flush_paragraph(); flush_list()
-                lines.append(fence(txt, guess_code_lang(txt) or "bash")); lines.append("")
+                flush_paragraph()
+                flush_list()
+                lines.append(fence(txt, guess_code_lang(txt) or "bash"))
+                lines.append("")
                 continue
-
-            list_buf and flush_list()
+            if list_buf:
+                flush_list()
             para_buf.append(txt)
-
         flush_paragraph()
         flush_list()
-
     return "\n".join(lines).strip() + "\n"
 
-# ---------- Gemini MD polishing helpers (optional) ----------
+# -------------------- Gemini MD polishing (optional) --------------------
 def _split_by_page_heading(md_text: str) -> List[str]:
     lines = (md_text or "").splitlines()
     chunks, cur = [], []
@@ -745,14 +991,27 @@ def _fix_unclosed_fences(md: str) -> str:
     n = md.count("```")
     return md if n % 2 == 0 else (md.rstrip() + "\n```")
 
-_GEMINI_MD_RULES = """
+_GEMINI_MD_RULES_FORMAT = """
 You are a precise Markdown formatter. Reformat the given Markdown:
 - KEEP ALL CONTENT EXACTLY (no additions/removals/translation).
 - Preserve headings exactly as is (including lines that start with '## Page ').
 - Normalize line wraps and spacing.
 - Convert command-like lines to fenced code blocks (bash).
 - Convert JSON-like blocks to fenced code blocks (json).
+- Preserve tables and images as-is.
 - Separate paragraphs and code blocks with one blank line.
+Return Markdown only.
+"""
+_GEMINI_MD_RULES_CORRECT = """
+You are an expert OCR post-processor for Thai/English documents that outputs clean Markdown.
+Tasks (do them conservatively):
+- Fix OCR errors in Thai: misplaced/duplicated diacritics, wrong vowel order, missing/extra spaces, broken words joined/split incorrectly, common misspellings from OCR.
+- Keep the meaning and factual data EXACTLY. DO NOT change numbers, dates, units, codes, IDs, or technical terms.
+- Preserve the document structure and headings as-is, especially lines that start with '## Page '.
+- Keep all tables, code blocks, and images unchanged except minor spacing fixes around them.
+- Convert command-like lines to fenced code blocks (bash) and JSON-like blocks to fenced code blocks (json), if needed.
+- If you are not confident about a word, keep the original.
+- Output valid Markdown only, with single blank line separation between paragraphs/blocks.
 Return Markdown only.
 """
 
@@ -760,67 +1019,65 @@ async def gemini_polish_markdown_by_page(md_text: str) -> str:
     global md_model
     if not USE_GEMINI_MD or not md_model or not md_text or len(md_text) < 10:
         return md_text
-
+    rules = _GEMINI_MD_RULES_CORRECT if GEMINI_MD_POLICY == "correct" else _GEMINI_MD_RULES_FORMAT
     chunks = _split_by_page_heading(md_text) or [md_text]
     polished: List[str] = []
-
     for i, chunk in enumerate(chunks):
-        prompt = f"{_GEMINI_MD_RULES}\n\n<md>\n{chunk}\n</md>"
+        prompt = f"""{rules}
+Language/domain hint: {GEMINI_MD_LANG_HINT}
+<md>
+{chunk}
+</md>"""
         try:
             resp = await asyncio.to_thread(md_model.generate_content, prompt)
-            out = (resp.text or "").strip()
-            if not out:
-                out = chunk
+            out = (resp.text or "").strip() or chunk
         except Exception as e:
             logger.warning(f"[Gemini-MD] chunk {i} failed: {e}; keep original.")
             out = chunk
         polished.append(_fix_unclosed_fences(out))
-
     return ("\n\n".join(polished)).strip() + "\n"
 
-# ---------- Embeddings ----------
+# -------------------- Embeddings --------------------
 async def async_generate_embedding(input_data: List[str]) -> Optional[List[List[float]]]:
     if not input_data:
         return None
     global embedding_http_session
     if embedding_http_session is None:
         embedding_http_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=CONCURRENCY))
-
+    async def _try_service(url: str, model: str, text_to_embed: str, label: str) -> Optional[List[float]]:
+        for attempt in range(3):
+            try:
+                timeout = aiohttp.ClientTimeout(total=120)
+                payload = {"model": model, "prompt": text_to_embed}
+                async with embedding_http_session.post(url, json=payload, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict):
+                            if isinstance(data.get("embedding"), list):
+                                return data["embedding"]
+                            if isinstance(data.get("data"), list) and data["data"]:
+                                first = data["data"][0]
+                                if isinstance(first, dict) and isinstance(first.get("embedding"), list):
+                                    return first["embedding"]
+                        logger.warning(f"[{label}] unexpected embedding response format")
+                    else:
+                        logger.warning(f"[{label}] Embedding API status {resp.status}, attempt {attempt+1}")
+                        await asyncio.sleep(2 * (attempt + 1))
+            except Exception as e:
+                logger.warning(f"[{label}] Connection error to Embedding API: {e}, attempt {attempt+1}")
+                await asyncio.sleep(2 * (attempt + 1))
+        return None
     async def _embed_one(text_to_embed: str) -> Optional[List[float]]:
-        async def _try_service(url, model, label):
-            for attempt in range(3):
-                try:
-                    timeout = aiohttp.ClientTimeout(total=120)
-                    payload = {"model": model, "prompt": text_to_embed}
-                    async with embedding_http_session.post(url, json=payload, timeout=timeout) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            if isinstance(data, dict):
-                                if isinstance(data.get("embedding"), list):
-                                    return data["embedding"]
-                                if isinstance(data.get("data"), list) and data["data"]:
-                                    first = data["data"][0]
-                                    if isinstance(first, dict) and isinstance(first.get("embedding"), list):
-                                        return first["embedding"]
-                            logger.warning(f"[{label}] unexpected embedding response format")
-                        else:
-                            logger.warning(f"[{label}] Embedding API status {resp.status}, attempt {attempt+1}")
-                            await asyncio.sleep(2 * (attempt + 1))
-                except Exception as e:
-                    logger.warning(f"[{label}] Connection error to Embedding API: {e}, attempt {attempt+1}")
-                    await asyncio.sleep(2 * (attempt + 1))
-            return None
-
-        primary_emb = await _try_service(OLLAMA_EMBEDDING_URL, OLLAMA_EMBEDDING_MODEL_NAME, "primary")
+        primary_emb = await _try_service(OLLAMA_EMBEDDING_URL, OLLAMA_EMBEDDING_MODEL_NAME, text_to_embed, "primary")
         if primary_emb is not None:
             return primary_emb
         if FALLBACK_EMBEDDING_URL and FALLBACK_EMBEDDING_MODEL_NAME:
             logger.warning("Primary embedding failed. Trying fallback.")
-            return await _try_service(FALLBACK_EMBEDDING_URL, FALLBACK_EMBEDDING_MODEL_NAME, "fallback")
+            return await _try_service(
+                FALLBACK_EMBEDDING_URL, FALLBACK_EMBEDDING_MODEL_NAME, text_to_embed, "fallback"
+            )
         return None
-
-    tasks = [_embed_one(text) for text in input_data]
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*[_embed_one(text) for text in input_data])
     return [e for e in results if e is not None] or None
 
 async def async_process_text_chunk(chunk_text: str, chunk_metadata: Dict[str, Any]) -> Optional[models.PointStruct]:
@@ -828,7 +1085,7 @@ async def async_process_text_chunk(chunk_text: str, chunk_metadata: Dict[str, An
     if not semaphore_embedding_call:
         return None
     async with semaphore_embedding_call:
-        chunk_id = chunk_metadata.get('chunk_id')
+        chunk_id = chunk_metadata.get("chunk_id")
         if not chunk_id:
             logger.error("Missing chunk_id in metadata")
             return None
@@ -846,19 +1103,103 @@ async def async_process_text_chunk(chunk_text: str, chunk_metadata: Dict[str, An
         payload = {"pageContent": chunk_text, "metadata": chunk_metadata}
         return models.PointStruct(id=chunk_id_str, vector=embedding_results[0], payload=payload)
 
-# ---------- Job Status & Webhook ----------
+# -------------------- Uniform helpers (reduce duplication) --------------------
+async def build_point_once(text: str, base_meta: Dict[str, Any], content_type: str) -> Tuple[List[models.PointStruct], int]:
+    meta = dict(base_meta)
+    meta.update({"content_type": content_type})
+    meta["chunk_id"] = make_chunk_id(meta, text)
+    point = await async_process_text_chunk(text, meta)
+    return ([point] if point else []), 1
+
+async def upsert_points(collection_name: str, points: List[models.PointStruct], activity_label: str) -> None:
+    global qdrant_client
+    if not points:
+        return
+    try:
+        await asyncio.to_thread(qdrant_client.upsert, collection_name=collection_name, wait=True, points=points)
+        await mark_activity(activity_label)
+    except Exception as e:
+        logger.error(f"[Qdrant] upsert failed: {e}", exc_info=True)
+        raise
+
+async def write_markdown(path: str, text: str) -> Optional[str]:
+    try:
+        async with aiofiles.open(path, "w", encoding="utf-8") as f:
+            await f.write(text)
+        return path
+    except Exception as e:
+        logger.warning(f"[MD] Write failed: {e}")
+        return None
+
+def page_heading(page_num: int) -> str:
+    return f"## Page {page_num}"
+
+def element_base_metadata(source_label: str, page_number: int, element_index: int, book_id: Optional[str]) -> Dict[str, Any]:
+    meta = {"source": source_label, "loc": {"pageNumber": page_number, "elementIndex": element_index}}
+    if book_id:
+        meta["book_id"] = book_id
+    return meta
+
+def parse_page_string(page_str: Optional[str]) -> Set[int]:
+    if not page_str:
+        return set()
+    page_numbers = set()
+    parts = page_str.split(",")
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                start, end = map(int, part.split("-"))
+                if start > end:
+                    start, end = end, start
+                page_numbers.update(range(start, end + 1))
+            else:
+                page_numbers.add(int(part))
+        except ValueError:
+            logger.warning(f"ไม่สามารถแปลงค่าหน้า '{part}' ได้ จะข้ามส่วนนี้ไป")
+    return page_numbers
+
+async def get_pdf_page_count(file_bytes: bytes) -> int:
+    if _fitz_available:
+        try:
+            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                return len(doc)
+        except Exception as e:
+            logger.warning(f"Could not use PyMuPDF for page count: {e}.")
+    if _pypdf_available:
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+            return len(reader.pages)
+        except Exception as e:
+            logger.warning(f"Could not use pypdf for page count: {e}")
+    try:
+        elements = await asyncio.to_thread(partition_pdf, file=io.BytesIO(file_bytes), strategy="fast")
+        if elements:
+            page_numbers = [
+                getattr(el.metadata, "page_number", None) or getattr(el, "metadata", {}).get("page_number") for el in elements
+            ]
+            page_numbers = [p for p in page_numbers if isinstance(p, int)]
+            return max(page_numbers) if page_numbers else 0
+        return 0
+    except Exception as e:
+        logger.warning(f"Could not determine page count by partitioning: {e}")
+        return 0
+
+# -------------------- Job Status & Webhook --------------------
 async def _read_job_statuses() -> Dict[str, Any]:
     async with job_status_lock:
         if not os.path.exists(JOB_STATUS_FILE):
             return {}
-        async with aiofiles.open(JOB_STATUS_FILE, mode='r', encoding="utf-8") as f:
+        async with aiofiles.open(JOB_STATUS_FILE, mode="r", encoding="utf-8") as f:
             content = await f.read()
             return json.loads(content) if content else {}
 
 async def _write_job_statuses(statuses: Dict[str, Any]):
     async with job_status_lock:
         tmp_path = JOB_STATUS_FILE + ".tmp"
-        async with aiofiles.open(tmp_path, mode='w', encoding="utf-8") as f:
+        async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
             await f.write(json.dumps(statuses, indent=2, ensure_ascii=False))
         os.replace(tmp_path, JOB_STATUS_FILE)
 
@@ -887,29 +1228,10 @@ async def notify_webhook(result_data: ProcessingResponse):
     except Exception as e:
         logger.warning(f"[BG] ส่ง Webhook ไม่สำเร็จ: {e}")
 
-# ---------- Library & Qdrant helpers ----------
-def parse_page_string(page_str: Optional[str]) -> Set[int]:
-    if not page_str:
-        return set()
-    page_numbers = set()
-    parts = page_str.split(',')
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            if '-' in part:
-                start, end = map(int, part.split('-'))
-                if start > end:
-                    start, end = end, start
-                page_numbers.update(range(start, end + 1))
-            else:
-                page_numbers.add(int(part))
-        except ValueError:
-            logger.warning(f"ไม่สามารถแปลงค่าหน้า '{part}' ได้ จะข้ามส่วนนี้ไป")
-    return page_numbers
-
-async def get_existing_page_numbers(collection_name: str, source_file_name: str, book_id: Optional[str] = None) -> Set[int]:
+# -------------------- Qdrant helpers --------------------
+async def get_existing_page_numbers(
+    collection_name: str, source_file_name: str, book_id: Optional[str] = None
+) -> Set[int]:
     global qdrant_client
     if qdrant_client is None:
         return set()
@@ -930,7 +1252,7 @@ async def get_existing_page_numbers(collection_name: str, source_file_name: str,
                 limit=250,
                 offset=next_offset,
                 with_payload=True,
-                with_vectors=False
+                with_vectors=False,
             )
             for point in response:
                 payload = point.payload or {}
@@ -944,6 +1266,96 @@ async def get_existing_page_numbers(collection_name: str, source_file_name: str,
         logger.warning(f"เกิดข้อผิดพลาดขณะดึงข้อมูลหน้าที่มีอยู่: {e}. จะถือว่ายังไม่มีหน้าใดๆ")
         return set()
 
+async def detect_embedding_dim() -> Optional[int]:
+    try:
+        emb = await async_generate_embedding(["__probe__"])
+        if emb and emb[0]:
+            return len(emb[0])
+    except Exception as e:
+        logger.warning(f"ตรวจจับมิติ embedding ล้มเหลว: {e}")
+    return None
+
+async def ensure_qdrant_collection(collection_name: str):
+    global qdrant_client
+    if qdrant_client is None:
+        raise RuntimeError("Qdrant client not initialized")
+    try:
+        await asyncio.to_thread(qdrant_client.get_collection, collection_name=collection_name)
+    except Exception:
+        dim = await detect_embedding_dim() or QDRANT_VECTOR_SIZE
+        if not dim:
+            logger.warning(f"ใช้ QDRANT_VECTOR_SIZE จาก env แทน (dim={dim})")
+        logger.info(f"ไม่พบ Collection '{collection_name}' กำลังสร้าง (dim={dim})...")
+        await asyncio.to_thread(
+            qdrant_client.create_collection,
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
+        )
+        logger.info(f"Collection '{collection_name}' สร้างสำเร็จแล้ว.")
+        try:
+            await asyncio.to_thread(
+                qdrant_client.create_payload_index,
+                collection_name=collection_name,
+                field_name="metadata.source",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+            await asyncio.to_thread(
+                qdrant_client.create_payload_index,
+                collection_name=collection_name,
+                field_name="metadata.loc.pageNumber",
+                field_schema=models.PayloadSchemaType.INTEGER,
+            )
+            await asyncio.to_thread(
+                qdrant_client.create_payload_index,
+                collection_name=collection_name,
+                field_name="pageContent",
+                field_schema=models.TextIndexParams(
+                    type=models.TextIndexType.TEXT,
+                    tokenizer=models.TokenizerType.WHITESPACE,
+                    min_token_len=2,
+                    max_token_len=15,
+                    lowercase=True,
+                ),
+            )
+            await asyncio.to_thread(
+                qdrant_client.create_payload_index,
+                collection_name=collection_name,
+                field_name="metadata.book_id",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+        except Exception as e:
+            logger.warning(f"สร้าง payload index ไม่ครบถ้วน: {e}")
+
+async def list_unique_sources_in_collection(collection_name: str) -> List[str]:
+    global qdrant_client
+    if qdrant_client is None:
+        raise RuntimeError("Qdrant client is not initialized")
+    unique_sources: Set[str] = set()
+    try:
+        next_offset = None
+        while True:
+            response, next_offset = await asyncio.to_thread(
+                qdrant_client.scroll,
+                collection_name=collection_name,
+                limit=250,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in response:
+                payload = point.payload or {}
+                meta = payload.get("metadata") or {}
+                source = meta.get("source")
+                if source:
+                    unique_sources.add(str(source))
+            if next_offset is None:
+                break
+        return sorted(unique_sources)
+    except Exception as e:
+        logger.error(f"[Qdrant] list_unique_sources_in_collection error: {e}")
+        raise
+
+# -------------------- Library API --------------------
 async def fetch_document_info(doc_id: Union[str, int]) -> Optional[Dict[str, Any]]:
     if not LIBRARY_API_TOKEN or not LIBRARY_API_BASE_URL:
         return None
@@ -984,8 +1396,8 @@ async def search_library_for_book(query: str) -> Optional[List[Dict[str, Any]]]:
             resp = await client.get(search_url, headers=headers, params=params)
             resp.raise_for_status()
             data = resp.json()
-            if isinstance(data, dict) and 'files' in data:
-                return data['files']
+            if isinstance(data, dict) and "files" in data:
+                return data["files"]
             return []
     except Exception as e:
         logger.error(f"ค้นหา Library ล้มเหลว: {e}")
@@ -1002,10 +1414,10 @@ async def download_book_from_library(file_id: str) -> Optional[Tuple[str, bytes]
         async with httpx.AsyncClient(timeout=None) as client:
             resp = await client.get(download_url, headers=headers)
             resp.raise_for_status()
-            content_disp = resp.headers.get('Content-Disposition', '')
+            content_disp = resp.headers.get("Content-Disposition", "")
             filename = file_id
-            if 'filename=' in content_disp:
-                filename = content_disp.split('filename=')[-1].strip('"')
+            if "filename=" in content_disp:
+                filename = content_disp.split("filename=")[-1].strip('"')
             data = resp.content
             logger.info(f"ดาวน์โหลดไฟล์ '{filename}' สำเร็จ")
             return filename, data
@@ -1013,99 +1425,105 @@ async def download_book_from_library(file_id: str) -> Optional[Tuple[str, bytes]
         logger.error(f"เกิดข้อผิดพลาดระหว่างดาวน์โหลดไฟล์ id '{file_id}' จาก Library: {e}")
         return None
 
-async def detect_embedding_dim() -> Optional[int]:
-    try:
-        emb = await async_generate_embedding(["__probe__"])
-        if emb and emb[0]:
-            return len(emb[0])
-    except Exception as e:
-        logger.warning(f"ตรวจจับมิติ embedding ล้มเหลว: {e}")
-    return None
-
-async def ensure_qdrant_collection(collection_name: str):
-    global qdrant_client
-    if qdrant_client is None:
-        raise RuntimeError("Qdrant client not initialized")
-    try:
-        await asyncio.to_thread(qdrant_client.get_collection, collection_name=collection_name)
-    except Exception:
-        dim = await detect_embedding_dim()
-        if not dim:
-            dim = QDRANT_VECTOR_SIZE
-            logger.warning(f"ใช้ QDRANT_VECTOR_SIZE จาก env แทน (dim={dim})")
-        logger.info(f"ไม่พบ Collection '{collection_name}' กำลังสร้าง (dim={dim})...")
-        await asyncio.to_thread(
-            qdrant_client.create_collection,
-            collection_name=collection_name,
-            vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
+# -------------------- Image & layout for Gemini OCR --------------------
+async def extract_page_images_with_coords(
+    file_bytes: bytes, pages: List[int], image_output_dir: str
+) -> Dict[int, List[Dict[str, Any]]]:
+    os.makedirs(image_output_dir, exist_ok=True)
+    elements = await asyncio.to_thread(
+        partition_pdf,
+        file=io.BytesIO(file_bytes),
+        strategy="hi_res",
+        include_metadata=True,
+        extract_images_in_pdf=True,
+        pages=pages,
+        image_output_dir_path=image_output_dir,
+        languages=OCR_LANGUAGES,
+        infer_table_structure=False,
+    )
+    images_by_page: Dict[int, List[Dict[str, Any]]] = {}
+    for el in elements or []:
+        if getattr(el, "category", "") not in {"Image", "Figure"}:
+            continue
+        md = el.metadata.to_dict() if getattr(el, "metadata", None) else {}
+        coords = (md.get("coordinates") or {})
+        points = coords.get("points") or []
+        if not points:
+            continue
+        xs, ys = [], []
+        for p in points:
+            if isinstance(p, dict):
+                xs.append(float(p.get("x", 0)))
+                ys.append(float(p.get("y", 0)))
+            elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                xs.append(float(p[0]))
+                ys.append(float(p[1]))
+        if not xs or not ys:
+            continue
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        W = float(coords.get("layout_width") or 0.0)
+        H = float(coords.get("layout_height") or 0.0)
+        pn = md.get("page_number") or md.get("page") or 1
+        img_path = md.get("image_path") or (md.get("image_paths") or [None])[0]
+        if not img_path or not os.path.exists(img_path):
+            continue
+        images_by_page.setdefault(pn, []).append(
+            {"abs_path": img_path, "min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y, "W": W, "H": H}
         )
-        logger.info(f"Collection '{collection_name}' สร้างสำเร็จแล้ว.")
-        try:
-            await asyncio.to_thread(
-                qdrant_client.create_payload_index,
-                collection_name=collection_name,
-                field_name="metadata.source",
-                field_schema=models.PayloadSchemaType.KEYWORD
-            )
-            await asyncio.to_thread(
-                qdrant_client.create_payload_index,
-                collection_name=collection_name,
-                field_name="metadata.loc.pageNumber",
-                field_schema=models.PayloadSchemaType.INTEGER
-            )
-            await asyncio.to_thread(
-                qdrant_client.create_payload_index,
-                collection_name=collection_name,
-                field_name="pageContent",
-                field_schema=models.TextIndexParams(
-                    type=models.TextIndexType.TEXT,
-                    tokenizer=models.TokenizerType.WHITESPACE,
-                    min_token_len=2,
-                    max_token_len=15,
-                    lowercase=True
-                )
-            )
-            await asyncio.to_thread(
-                qdrant_client.create_payload_index,
-                collection_name=collection_name,
-                field_name="metadata.book_id",
-                field_schema=models.PayloadSchemaType.KEYWORD
-            )
-        except Exception as e:
-            logger.warning(f"สร้าง payload index ไม่ครบถ้วน: {e}")
+    for pn in images_by_page:
+        images_by_page[pn].sort(key=lambda r: r["min_y"])
+    return images_by_page
 
-async def list_unique_sources_in_collection(collection_name: str) -> List[str]:
-    """ดึงรายชื่อค่า metadata.source ที่ไม่ซ้ำภายใน collection"""
-    global qdrant_client
-    if qdrant_client is None:
-        raise RuntimeError("Qdrant client is not initialized")
-    unique_sources: Set[str] = set()
-    try:
-        next_offset = None
-        while True:
-            response, next_offset = await asyncio.to_thread(
-                qdrant_client.scroll,
-                collection_name=collection_name,
-                limit=250,
-                offset=next_offset,
-                with_payload=True,
-                with_vectors=False,
-            )
-            for point in response:
-                payload = point.payload or {}
-                meta = payload.get("metadata") or {}
-                source = meta.get("source")
-                if source:
-                    unique_sources.add(str(source))
-            if next_offset is None:
-                break
-        return sorted(unique_sources)
-    except Exception as e:
-        logger.error(f"[Qdrant] list_unique_sources_in_collection error: {e}")
-        raise
+async def enlarge_detected_figures(
+    file_bytes: bytes, images_by_page: Dict[int, List[Dict[str, Any]]], pages: List[int], dpi: int, out_dir: str
+) -> Dict[int, List[Dict[str, Any]]]:
+    os.makedirs(out_dir, exist_ok=True)
+    for pn in pages:
+        layout_list = images_by_page.get(pn, [])
+        if not layout_list:
+            continue
+        page_img = render_page_to_image(file_bytes, pn, dpi=dpi)
+        W, H = page_img.size
 
-# ---------- Main processing with Markdown export ----------
-async def process_table_element(element, base_metadata: dict) -> Tuple[List[models.PointStruct], int]:
+        rect_pairs: List[Tuple[Dict[str, Any], Tuple[int,int,int,int]]] = []
+        for r in layout_list:
+            rect_px = layout_rect_to_pixels(r, W, H)
+            if not rect_px:
+                continue
+            rect_px = expand_rect_px(rect_px, W, H)
+            if FIGURE_AUTO_EXPAND:
+                rect_px = expand_rect_adaptive(page_img, rect_px,
+                                               max_growth_px=FIGURE_MAX_GROWTH_PX,
+                                               step_px=FIGURE_GROW_STEP_PX,
+                                               edge_thresh=FIGURE_EDGE_INK_RATIO)
+            rect_pairs.append((r, rect_px))
+
+        merged_rects = merge_overlapping_rects([px for _, px in rect_pairs], iou_thr=FIGURE_OVERLAP_IOU)
+
+        new_items: List[Dict[str, Any]] = []
+        for idx, rect_px_big in enumerate(merged_rects, start=1):
+            crop = page_img.crop(rect_px_big)
+            fname = f"figure-{pn:02d}-{idx:02d}.png"
+            fpath = os.path.join(out_dir, fname)
+            try:
+                crop.save(fpath)
+            except Exception:
+                fname = f"figure-{pn:02d}-{idx:02d}-{uuid.uuid4().hex[:6]}.png"
+                fpath = os.path.join(out_dir, fname)
+                crop.save(fpath)
+            new_items.append({
+                "abs_path": fpath,
+                "rect_px": rect_px_big,
+                "W": W,
+                "H": H,
+            })
+
+        images_by_page[pn] = new_items
+    return images_by_page
+
+# -------------------- Table processing --------------------
+async def process_table_element(element, base_metadata: Dict[str, Any]) -> Tuple[List[models.PointStruct], int]:
     points_to_upsert: List[models.PointStruct] = []
     attempted = 0
     table_id = str(uuid.uuid4())
@@ -1136,6 +1554,7 @@ async def process_table_element(element, base_metadata: dict) -> Tuple[List[mode
         logger.warning(f"Could not parse or serialize markdown table for {base_metadata.get('source')}: {e}")
     return points_to_upsert, attempted
 
+# -------------------- Per-page processing (Unstructured) --------------------
 async def process_and_upsert_single_page(
     file_bytes: bytes,
     page_num: int,
@@ -1160,161 +1579,100 @@ async def process_and_upsert_single_page(
         )
     except Exception as e:
         logger.error(f"[BG] partition_pdf ล้มเหลวที่หน้า {page_num}: {e}", exc_info=True)
-        return 0, 1, f"## Page {page_num}\n\n"
-
+        return 0, 1, f"{page_heading(page_num)}\n\n"
     elements = [el for el in elements if _elem_page_number(el) in (page_num, None)]
     if not elements:
         logger.info(f"--- [BG] Unstructured ไม่พบ elements ใดๆ ในหน้า {page_num} ---")
-        return 0, 0, f"## Page {page_num}\n\n"
-
-    page_md_lines: List[str] = [f"## Page {page_num}", ""]
-    buf: List[str] = []
-
-    def flush_buf():
-        if buf:
-            joined = clean_text(" ".join(buf).strip())
+        return 0, 0, f"{page_heading(page_num)}\n\n"
+    page_md_lines: List[str] = [page_heading(page_num), ""]
+    para_buf: List[str] = []
+    def flush_paragraph():
+        if para_buf:
+            joined = clean_text(" ".join(para_buf).strip())
             if joined:
                 page_md_lines.append(joined)
                 page_md_lines.append("")
-            buf.clear()
-
-    processing_tasks = []
+            para_buf.clear()
+    tasks: List[asyncio.Task] = []
     attempted_points = 0
     successful_points: List[models.PointStruct] = []
-
     for i, element in enumerate(elements):
-        if is_noise(element):
+        if is_header_footer(element):
             continue
-
         elem_pn = _elem_page_number(element) or page_num
-        base_metadata = {"source": source_label, "loc": {"pageNumber": elem_pn, "elementIndex": i}}
-        if book_id:
-            base_metadata["book_id"] = book_id
-
+        base_meta = element_base_metadata(source_label, elem_pn, i, book_id)
         category = getattr(element, "category", None)
         text_val = getattr(element, "text", None)
-
         if category == "Table":
-            flush_buf()
+            flush_paragraph()
             table_md = render_table(element)
             if table_md:
                 page_md_lines.append(table_md)
                 page_md_lines.append("")
-            processing_tasks.append(process_table_element(element, base_metadata))
+            tasks.append(asyncio.create_task(process_table_element(element, base_meta)))
             continue
-
         if category in {"Image", "Figure"}:
-            flush_buf()
+            flush_paragraph()
             img_md = render_image(element, image_output_dir or OCR_MD_OUTPUT_DIR)
             if img_md:
                 page_md_lines.append(img_md)
                 page_md_lines.append("")
-            async def process_image_element(img_element, meta):
-                attempted = 1
+            async def process_image(img_element, meta):
+                description = "No description available."
                 try:
                     md = img_element.metadata.to_dict() if getattr(img_element, "metadata", None) else {}
-                    img_path = md.get("image_path")
-                    if not img_path:
-                        paths = md.get("image_paths") or []
-                        img_path = paths[0] if paths else None
-                    description = "No description available."
+                    img_path = md.get("image_path") or (md.get("image_paths") or [None])[0]
                     if img_path and os.path.exists(img_path):
                         with Image.open(img_path) as pil_image:
                             description = await generate_image_caption(pil_image)
                     elif hasattr(img_element, "image_base64") and img_element.image_base64:
                         with Image.open(io.BytesIO(base64.b64decode(img_element.image_base64))) as pil_image:
                             description = await generate_image_caption(pil_image)
-                    text_to_embed = f"Image Description: {description}"
-                    img_meta = meta.copy()
-                    img_meta.update({"content_type": "image_summary"})
-                    img_meta["chunk_id"] = make_chunk_id(img_meta, text_to_embed)
-                    point = await async_process_text_chunk(text_to_embed, img_meta)
-                    return ([point] if point else []), attempted
                 except Exception as img_err:
                     logger.error(f"Failed to process image element: {img_err}", exc_info=True)
-                    return ([], attempted)
-            processing_tasks.append(process_image_element(element, base_metadata))
+                return await build_point_once(f"Image Description: {description}", meta, "image_summary")
+            tasks.append(asyncio.create_task(process_image(element, base_meta)))
             continue
-
         if category == "Title":
-            flush_buf()
+            flush_paragraph()
             title_txt = clean_text(text_val or "")
             if title_txt:
                 page_md_lines.append(f"## {title_txt}")
                 page_md_lines.append("")
-                async def process_text_element(text, meta, content_type: str):
-                    attempted = 1
-                    text_meta = meta.copy()
-                    text_meta.update({"content_type": content_type})
-                    text_meta["chunk_id"] = make_chunk_id(text_meta, text)
-                    point = await async_process_text_chunk(text, text_meta)
-                    return ([point] if point else []), attempted
-                processing_tasks.append(process_text_element(title_txt, base_metadata, "Title"))
+                tasks.append(asyncio.create_task(build_point_once(title_txt, base_meta, "Title")))
             continue
-
         if category == "ListItem":
-            flush_buf()
+            flush_paragraph()
             item_txt = clean_text(text_val or "")
             if item_txt:
                 page_md_lines.append(f"- {item_txt}")
                 page_md_lines.append("")
-                async def process_text_element(text, meta, content_type: str):
-                    attempted = 1
-                    text_meta = meta.copy()
-                    text_meta.update({"content_type": content_type})
-                    text_meta["chunk_id"] = make_chunk_id(text_meta, text)
-                    point = await async_process_text_chunk(text, text_meta)
-                    return ([point] if point else []), attempted
-                processing_tasks.append(process_text_element(item_txt, base_metadata, "ListItem"))
+                tasks.append(asyncio.create_task(build_point_once(item_txt, base_meta, "ListItem")))
             continue
-
         txt = clean_text(text_val or "")
         if not txt:
             continue
-        buf.append(txt)
-
-        async def process_text_element(text, meta, content_type: str):
-            attempted = 1
-            text_meta = meta.copy()
-            text_meta.update({"content_type": content_type})
-            text_meta["chunk_id"] = make_chunk_id(text_meta, text)
-            point = await async_process_text_chunk(text, text_meta)
-            return ([point] if point else []), attempted
-
-        processing_tasks.append(process_text_element(txt, base_metadata, category or "Text"))
-
-    flush_buf()
-
-    results = await asyncio.gather(*processing_tasks, return_exceptions=True)
+        para_buf.append(txt)
+        tasks.append(asyncio.create_task(build_point_once(txt, base_meta, category or "Text")))
+    flush_paragraph()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
     for item in results:
         if isinstance(item, Exception):
             logger.error(f"[BG] Element task error (page {page_num}): {item}", exc_info=True)
             continue
-    # table: (points, attempted) / text/image: ([point] or None, attempted)
-    for item in results:
-        if isinstance(item, Exception):
-            continue
+        # table returns (points, attempted), others return ([point], 1)
         if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], list):
             pts, att = item
             successful_points.extend([p for p in pts if p])
             attempted_points += att
-        else:
-            points, attempted = item
-            successful_points.extend([p for p in points if p])
-            attempted_points += attempted
-
     failed_count = max(0, attempted_points - len(successful_points))
-
     if successful_points:
         try:
-            await asyncio.to_thread(
-                qdrant_client.upsert, collection_name=collection_name, wait=True, points=successful_points
-            )
-            await mark_activity("qdrant:upsert")
+            await upsert_points(collection_name, successful_points, "qdrant:upsert")
             logger.info(f"[BG] บันทึก {len(successful_points)} points จากหน้า {page_num} ลง Qdrant สำเร็จ")
-        except Exception as upsert_err:
-            logger.error(f"[BG] Qdrant upsert ล้มเหลวในหน้า {page_num}: {upsert_err}", exc_info=True)
-
+        except Exception:
+            # already logged
+            pass
     logger.info(f"--- [BG] จบการประมวลผลหน้า {page_num} ---")
     return len(successful_points), failed_count, ("\n".join(page_md_lines) + "\n")
 
@@ -1334,7 +1692,7 @@ async def page_worker_with_semaphore(
             file_bytes, page_num, source_label, collection_name, book_id, image_output_dir
         )
 
-# ---------- Batch mode for large/scanned PDFs ----------
+# -------------------- Batch mode --------------------
 async def _preview_table_pages(file_bytes: bytes, pages: List[int]) -> Set[int]:
     if not PREVIEW_TABLES:
         return set()
@@ -1365,7 +1723,7 @@ async def process_batch_pages(
     image_output_dir: str,
 ) -> List[Tuple[int, int, str]]:
     results_per_page: Dict[int, Dict[str, Any]] = {
-        p: {"points": [], "attempted": 0, "md_lines": [f"## Page {p}", ""]} for p in batch_pages
+        p: {"points": [], "attempted": 0, "md_lines": [page_heading(p), ""]} for p in batch_pages
     }
     table_pages = await _preview_table_pages(file_bytes, batch_pages) if PREVIEW_TABLES else set()
     non_table_pages = [p for p in batch_pages if p not in table_pages]
@@ -1400,32 +1758,27 @@ async def process_batch_pages(
     except Exception as e:
         logger.error(f"[Batch] partition_pdf failed: {e}", exc_info=True)
         return [(0, 0, "\n".join(results_per_page[p]["md_lines"]) + "\n") for p in batch_pages]
-
-    clean_elements = [el for el in all_elements if not (is_noise(el) or is_header_footer(el))]
+    clean_elements = [el for el in all_elements if not is_header_footer(el)]
     clean_elements = sort_by_reading_order(clean_elements)
-
     grouped: Dict[int, List[Any]] = {}
     for el in clean_elements:
         pn = _elem_page_number(el)
         if pn in results_per_page:
             grouped.setdefault(pn, []).append(el)
-
     for pn in batch_pages:
         elements = grouped.get(pn, [])
         md_lines = results_per_page[pn]["md_lines"]
         attempted_points = 0
-
         para_buf: List[str] = []
         list_buf: List[str] = []
-
         def flush_paragraph():
             nonlocal para_buf
             if para_buf:
                 joined = clean_text(" ".join(para_buf).strip())
                 if joined:
-                    md_lines.append(joined); md_lines.append("")
+                    md_lines.append(joined)
+                    md_lines.append("")
                 para_buf = []
-
         def flush_list():
             nonlocal list_buf
             if list_buf:
@@ -1433,68 +1786,48 @@ async def process_batch_pages(
                     md_lines.append(f"- {clean_text(li)}")
                 md_lines.append("")
                 list_buf = []
-
-        tasks = []
-
+        tasks: List[asyncio.Task] = []
         for idx, el in enumerate(elements):
             cat = getattr(el, "category", "")
             txt = clean_text(getattr(el, "text", "") or "")
-
-            base_meta = {"source": source_label, "loc": {"pageNumber": pn, "elementIndex": idx}}
-            if book_id:
-                base_meta["book_id"] = book_id
-
+            base_meta = element_base_metadata(source_label, pn, idx, book_id)
             if cat == "Title":
-                flush_paragraph(); flush_list()
+                flush_paragraph()
+                flush_list()
                 if is_commandish_title(txt):
-                    md_lines.append(fence(txt, guess_code_lang(txt) or "bash")); md_lines.append("")
-                    async def _proc():
-                        nonlocal attempted_points
-                        attempted_points += 1
-                        meta = base_meta.copy(); meta.update({"content_type": "Code"})
-                        meta["chunk_id"] = make_chunk_id(meta, txt)
-                        return await async_process_text_chunk(txt, meta)
-                    tasks.append(_proc())
+                    md_lines.append(fence(txt, guess_code_lang(txt) or "bash"))
+                    md_lines.append("")
+                    tasks.append(asyncio.create_task(build_point_once(txt, base_meta, "Code")))
                 else:
-                    md_lines.append(f"## {txt}"); md_lines.append("")
-                    async def _proc():
-                        nonlocal attempted_points
-                        attempted_points += 1
-                        meta = base_meta.copy(); meta.update({"content_type": "Title"})
-                        meta["chunk_id"] = make_chunk_id(meta, txt)
-                        return await async_process_text_chunk(txt, meta)
-                    tasks.append(_proc())
+                    md_lines.append(f"## {txt}")
+                    md_lines.append("")
+                    tasks.append(asyncio.create_task(build_point_once(txt, base_meta, "Title")))
+                attempted_points += 1
                 continue
-
             if cat == "ListItem":
                 flush_paragraph()
                 if txt:
                     list_buf.append(txt)
-                    async def _proc():
-                        nonlocal attempted_points
-                        attempted_points += 1
-                        meta = base_meta.copy(); meta.update({"content_type": "ListItem"})
-                        meta["chunk_id"] = make_chunk_id(meta, txt)
-                        return await async_process_text_chunk(txt, meta)
-                    tasks.append(_proc())
+                    tasks.append(asyncio.create_task(build_point_once(txt, base_meta, "ListItem")))
+                    attempted_points += 1
                 continue
-
             if cat == "Table":
-                flush_paragraph(); flush_list()
+                flush_paragraph()
+                flush_list()
                 tbl = render_table(el)
                 if tbl:
-                    md_lines.append(tbl); md_lines.append("")
-                tasks.append(process_table_element(el, base_meta))
+                    md_lines.append(tbl)
+                    md_lines.append("")
+                tasks.append(asyncio.create_task(process_table_element(el, base_meta)))
                 continue
-
             if cat in {"Image", "Figure"}:
-                flush_paragraph(); flush_list()
+                flush_paragraph()
+                flush_list()
                 img_md = render_image(el, image_output_dir)
                 if img_md:
-                    md_lines.append(img_md); md_lines.append("")
-                async def _proc():
-                    nonlocal attempted_points
-                    attempted_points += 1
+                    md_lines.append(img_md)
+                    md_lines.append("")
+                async def _proc_image():
                     description = "No description available."
                     try:
                         md = el.metadata.to_dict() if getattr(el, "metadata", None) else {}
@@ -1507,39 +1840,26 @@ async def process_batch_pages(
                                 description = await generate_image_caption(pil)
                     except Exception as e:
                         logger.warning(f"[Batch] image caption failed (page {pn}): {e}")
-                    text_to_embed = f"Image Description: {description}"
-                    meta = base_meta.copy(); meta.update({"content_type": "image_summary"})
-                    meta["chunk_id"] = make_chunk_id(meta, text_to_embed)
-                    return await async_process_text_chunk(text_to_embed, meta)
-                tasks.append(_proc())
+                    return await build_point_once(f"Image Description: {description}", base_meta, "image_summary")
+                tasks.append(asyncio.create_task(_proc_image()))
+                attempted_points += 1
                 continue
-
             if txt:
                 if looks_jsonish(txt) or is_cli_command_line(txt) or token_ratio(txt) > 0.18:
-                    flush_paragraph(); flush_list()
+                    flush_paragraph()
+                    flush_list()
                     lang = "json" if looks_jsonish(txt) else (guess_code_lang(txt) or "bash")
-                    md_lines.append(fence(txt, lang)); md_lines.append("")
-                    async def _proc():
-                        nonlocal attempted_points
-                        attempted_points += 1
-                        meta = base_meta.copy(); meta.update({"content_type": "Code"})
-                        meta["chunk_id"] = make_chunk_id(meta, txt)
-                        return await async_process_text_chunk(txt, meta)
-                    tasks.append(_proc())
+                    md_lines.append(fence(txt, lang))
+                    md_lines.append("")
+                    tasks.append(asyncio.create_task(build_point_once(txt, base_meta, "Code")))
                 else:
-                    list_buf and flush_list()
+                    if list_buf:
+                        flush_list()
                     para_buf.append(txt)
-                    async def _proc():
-                        nonlocal attempted_points
-                        attempted_points += 1
-                        meta = base_meta.copy(); meta.update({"content_type": cat or "Text"})
-                        meta["chunk_id"] = make_chunk_id(meta, txt)
-                        return await async_process_text_chunk(txt, meta)
-                    tasks.append(_proc())
-
+                    tasks.append(asyncio.create_task(build_point_once(txt, base_meta, cat or "Text")))
+                attempted_points += 1
         flush_paragraph()
         flush_list()
-
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
         points: List[models.PointStruct] = []
         for item in gathered:
@@ -1549,26 +1869,19 @@ async def process_batch_pages(
             if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], list):
                 pts, att = item
                 points.extend([p for p in pts if p])
-                attempted_points += att
-            elif item:
-                points.append(item)
-
+                attempted_points += att  # นับ attempted จาก table rows/summary
         results_per_page[pn]["points"] = points
         results_per_page[pn]["attempted"] = attempted_points
-
+    # Upsert all points (batch)
     all_points: List[models.PointStruct] = []
     for p in batch_pages:
         all_points.extend(results_per_page[p]["points"])
     if all_points:
         try:
-            await asyncio.to_thread(
-                qdrant_client.upsert, collection_name=collection_name, wait=True, points=all_points
-            )
-            await mark_activity("qdrant:upsert:batch")
+            await upsert_points(collection_name, all_points, "qdrant:upsert:batch")
             logger.info(f"[Batch] Upsert {len(all_points)} points for pages {batch_pages[0]}..{batch_pages[-1]} OK")
-        except Exception as e:
-            logger.error(f"[Batch] Qdrant upsert failed: {e}", exc_info=True)
-
+        except Exception:
+            pass
     results: List[Tuple[int, int, str]] = []
     for p in batch_pages:
         attempted = results_per_page[p]["attempted"]
@@ -1578,9 +1891,13 @@ async def process_batch_pages(
         results.append((success, failed, page_md))
     return results
 
-# ---------- Background processing ----------
+# -------------------- Background task --------------------
 async def process_pdf_in_background(
-    file_path_key: str, file_bytes: bytes, file_name: str, pages_str: Optional[str] = None, custom_collection_name: Optional[str] = None
+    file_path_key: str,
+    file_bytes: bytes,
+    file_name: str,
+    pages_str: Optional[str] = None,
+    custom_collection_name: Optional[str] = None,
 ):
     original_file_name = file_name.strip()
     source_label = os.path.splitext(original_file_name)[0]
@@ -1596,59 +1913,29 @@ async def process_pdf_in_background(
             book_id = str(file_path_key)
     except Exception as e:
         logger.warning(f"Could not fetch doc info for {file_path_key}: {e}")
-
-    collection_name = custom_collection_name.strip().lower() if custom_collection_name else "".join(
-        c for c in source_label if c.isalnum() or c in ['-', '_']
-    ).lower() or f"doc_{uuid.uuid4().hex}"
-
+    collection_name = (
+        custom_collection_name.strip().lower()
+        if custom_collection_name
+        else "".join(c for c in source_label if c.isalnum() or c in ["-", "_"]).lower() or f"doc_{uuid.uuid4().hex}"
+    )
     await update_job_status(file_path_key, "processing", {"file_path": original_file_name, "collection_name": collection_name})
-
     total_successful_chunks = 0
     total_failed_chunks = 0
-    final_response = None
+    final_response: Optional[ProcessingResponse] = None
     md_output_path: Optional[str] = None
-
     try:
         await ensure_qdrant_collection(collection_name)
-
         doc_title = _safe_filename(source_label or os.path.splitext(original_file_name)[0])
         image_output_dir = os.path.join(OCR_MD_OUTPUT_DIR, f"{doc_title}_images")
         os.makedirs(image_output_dir, exist_ok=True)
-
-        total_pages_in_doc = 0
-
-        if _fitz_available:
-            try:
-                with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-                    total_pages_in_doc = len(doc)
-            except Exception as e:
-                logger.warning(f"Could not use PyMuPDF for page count: {e}. Falling back to other methods.")
-
-        if total_pages_in_doc == 0 and _pypdf_available:
-            try:
-                reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-                total_pages_in_doc = len(reader.pages)
-            except Exception as e:
-                logger.warning(f"Could not use pypdf for page count: {e}")
-
-        if total_pages_in_doc == 0:
-            try:
-                elements = await asyncio.to_thread(partition_pdf, file=io.BytesIO(file_bytes), strategy="fast")
-                if elements:
-                    page_numbers = [getattr(el.metadata, "page_number", None) or getattr(el, "metadata", {}).get("page_number") for el in elements]
-                    page_numbers = [p for p in page_numbers if isinstance(p, int)]
-                    total_pages_in_doc = max(page_numbers) if page_numbers else 0
-                if total_pages_in_doc == 0:
-                    raise RuntimeError("Page count detection failed (no elements with page_number).")
-            except Exception as e:
-                await update_job_status(file_path_key, "failed", {"error": f"Could not determine page count: {e}"})
-                return
-
+        total_pages_in_doc = await get_pdf_page_count(file_bytes)
+        if total_pages_in_doc <= 0:
+            await update_job_status(file_path_key, "failed", {"error": "Could not determine page count."})
+            return
         requested_pages = parse_page_string(pages_str)
         existing_pages = await get_existing_page_numbers(collection_name, source_label, book_id)
         all_doc_pages = set(range(1, total_pages_in_doc + 1))
         pages_to_process = (requested_pages - existing_pages) if requested_pages else (all_doc_pages - existing_pages)
-
         if not pages_to_process:
             final_response = ProcessingResponse(
                 collection_name=collection_name,
@@ -1656,80 +1943,186 @@ async def process_pdf_in_background(
                 processed_chunks=0,
                 failed_chunks=0,
                 message="All requested pages already processed.",
-                file_name=original_file_name
+                file_name=original_file_name,
             )
         else:
             pages_to_iterate = sorted([p for p in pages_to_process if 1 <= p <= total_pages_in_doc])
-            logger.info(f"[BG] จะทำการประมวลผลหน้าใหม่ {len(pages_to_iterate)} หน้า (สูงสุด {PAGE_CONCURRENCY} หน้าพร้อมกัน): {pages_to_iterate}")
-
-            results: List[Tuple[int, int, str]] = []
-            if LARGE_PDF_MODE:
-                for batch in _chunk_list(pages_to_iterate, BATCH_PAGE_SIZE):
-                    logger.info(f"[BG] Batch processing pages: {batch[0]}..{batch[-1]} (size={len(batch)})")
-                    batch_results = await process_batch_pages(
-                        file_bytes=file_bytes,
-                        batch_pages=batch,
-                        source_label=source_label,
-                        collection_name=collection_name,
-                        book_id=book_id,
-                        image_output_dir=image_output_dir,
-                    )
-                    results.extend(batch_results)
-            else:
-                tasks = [
-                    page_worker_with_semaphore(file_bytes, page_num, source_label, collection_name, book_id, image_output_dir)
-                    for page_num in pages_to_iterate
-                ]
-                results = await asyncio.gather(*tasks)
-
-            total_successful_chunks = sum(res[0] for res in results)
-            total_failed_chunks = sum(res[1] for res in results)
-
-            if SAVE_MD_ENABLED:
+            logger.info(
+                f"[BG] จะทำการประมวลผลหน้าใหม่ {len(pages_to_iterate)} หน้า (สูงสุด {PAGE_CONCURRENCY} หน้าพร้อมกัน): {pages_to_iterate}"
+            )
+            if OCR_MODE == "gemini":
+                if not _fitz_available:
+                    raise RuntimeError("OCR_MODE=gemini ต้องติดตั้ง PyMuPDF (fitz) เพื่อเรนเดอร์ภาพของหน้า")
+                # เตรียมไฟล์ MD
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 md_filename = f"{doc_title}_{ts}.md"
                 md_output_path = os.path.join(OCR_MD_OUTPUT_DIR, md_filename)
-
-                md_text = ""
-                if MD_REBUILD_WHOLEDOC:
-                    md_text = await rebuild_markdown_whole_doc(
-                        file_bytes=file_bytes,
-                        pages_to_iterate=pages_to_iterate,
-                        source_label=source_label,
-                        image_output_dir=image_output_dir,
-                    )
-                if not md_text:
-                    combined_md = [f"# {source_label or original_file_name}", ""]
-                    for (_, _, page_md) in results:
-                        combined_md.append(page_md)
-                    md_text = "\n".join(combined_md)
-
-                # ให้ Gemini ช่วย polish (ถ้าเปิด USE_GEMINI_MD)
-                try:
-                    md_text = await gemini_polish_markdown_by_page(md_text)
-                except Exception as e:
-                    logger.warning(f"[Gemini-MD] polishing failed, keep original: {e}")
-
-                try:
-                    async with aiofiles.open(md_output_path, "w", encoding="utf-8") as f:
-                        await f.write(md_text)
-                    logger.info(f"[BG] บันทึก Markdown: {md_output_path}")
-                except Exception as e:
-                    logger.warning(f"[BG] บันทึก Markdown ล้มเหลว: {e}")
-                    md_output_path = None
-
-            status_code = "success" if total_successful_chunks > 0 else "warning"
-            extra = f" Markdown saved to: {md_output_path}" if md_output_path else ""
-            message = f"Processed {total_successful_chunks} new chunks into collection '{collection_name}'.{extra}"
-            final_response = ProcessingResponse(
-                collection_name=collection_name,
-                status=status_code,
-                processed_chunks=total_successful_chunks,
-                failed_chunks=total_failed_chunks,
-                message=message,
-                file_name=original_file_name
-            )
-
+                md_base_dir = os.path.dirname(md_output_path)
+                # 1) ดึงรูป + พิกัด
+                images_by_page = await extract_page_images_with_coords(file_bytes, pages_to_iterate, image_output_dir)
+                # 2) ขยายกรอบรูปแบบ adaptive (+ รวมกรอบทับซ้อน)
+                images_by_page = await enlarge_detected_figures(
+                    file_bytes=file_bytes, images_by_page=images_by_page, pages=pages_to_iterate, dpi=OCR_PAGE_DPI, out_dir=image_output_dir
+                )
+                per_page_md: List[str] = []
+                for pn in pages_to_iterate:
+                    # Render page
+                    try:
+                        page_img = render_page_to_image(file_bytes, pn, dpi=OCR_PAGE_DPI)
+                    except Exception as e:
+                        logger.error(f"Render page {pn} failed: {e}")
+                        per_page_md.append(f"{page_heading(pn)}\n\n")
+                        continue
+                    W, H = page_img.size
+                    # จับคู่ layout + rect_px (เรียงตาม y0) โดยให้ใช้ rect_px ที่ผ่าน adaptive แล้วเป็นหลัก
+                    pairs: List[Tuple[Dict[str, Any], Tuple[int, int, int, int]]] = []
+                    for r in images_by_page.get(pn, []):
+                        px = r.get("rect_px")
+                        if not px:
+                            px = layout_rect_to_pixels(r, W, H)
+                            if px:
+                                px = expand_rect_px(px, W, H)
+                                if FIGURE_AUTO_EXPAND:
+                                    px = expand_rect_adaptive(page_img, px,
+                                                              max_growth_px=FIGURE_MAX_GROWTH_PX,
+                                                              step_px=FIGURE_GROW_STEP_PX,
+                                                              edge_thresh=FIGURE_EDGE_INK_RATIO)
+                        if px:
+                            pairs.append((r, px))
+                    pairs.sort(key=lambda p: p[1][1])  # sort by top y
+                    parts: List[str] = [page_heading(pn), ""]
+                    y_cursor = 0
+                    async def _ocr_band(y_top: int, y_bot: int):
+                        if y_bot - y_top < max(1, OCR_MIN_BAND_HEIGHT_PX):
+                            return
+                        band = page_img.crop((0, y_top, W, y_bot))
+                        draw = ImageDraw.Draw(band)
+                        for _, (rx0, ry0, rx1, ry1) in pairs:
+                            # ใช้กรอบที่ขยายแล้วโดยตรง ไม่ต้องขยายเพิ่มอีก
+                            ex0, ey0, ex1, ey1 = rx0, ry0, rx1, ry1
+                            oy0 = max(y_top, ey0)
+                            oy1 = min(y_bot, ey1)
+                            if oy1 > oy0:
+                                bx0, by0 = ex0, oy0 - y_top
+                                bx1, by1 = ex1, oy1 - y_top
+                                draw.rectangle((bx0, by0, bx1, by1), fill="white")
+                        try:
+                            text = await gemini_ocr_text_from_masked_page(band)
+                        except Exception as e:
+                            logger.error(f"OCR band page {pn} [{y_top}:{y_bot}] failed: {e}")
+                            text = ""
+                        if text.strip():
+                            parts.append(text.strip())
+                            parts.append("")
+                    # OCR ก่อนรูป -> แทรกรูป -> ขยับ cursor
+                    for layout, (_, y0, _, y1) in pairs:
+                        band_top = y_cursor
+                        band_bot = max(band_top, y0 - OCR_IMAGE_PADDING_PX)
+                        await _ocr_band(band_top, band_bot)
+                        if layout.get("abs_path"):
+                            rel = os.path.relpath(layout["abs_path"], md_base_dir).replace(os.sep, "/")
+                            parts.append(f"![]({rel})")
+                            parts.append("")
+                        y_cursor = max(y_cursor, y1 + OCR_IMAGE_PADDING_PX)
+                    # OCR ช่วงท้ายหน้า
+                    await _ocr_band(y_cursor, H)
+                    page_md = "\n".join(parts).rstrip() + "\n"
+                    per_page_md.append(page_md)
+                    # Chunk + embed + upsert
+                    attempted = 0
+                    points: List[models.PointStruct] = []
+                    for idx, chunk in enumerate(split_md_into_chunks(page_md, max_len=1200), start=1):
+                        attempted += 1
+                        meta = element_base_metadata(source_label, pn, idx, book_id)
+                        meta["content_type"] = "ocr_md"
+                        meta["chunk_id"] = make_chunk_id(meta, chunk)
+                        point = await async_process_text_chunk(chunk, meta)
+                        if point:
+                            points.append(point)
+                    if points:
+                        try:
+                            await upsert_points(collection_name, points, "qdrant:upsert:gemini_inline")
+                            total_successful_chunks += len(points)
+                        except Exception as e:
+                            logger.error(f"[Gemini OCR inline] Upsert failed at page {pn}: {e}")
+                            total_failed_chunks += attempted
+                    else:
+                        total_failed_chunks += attempted
+                # Save Markdown
+                if SAVE_MD_ENABLED:
+                    md_text = "# " + (source_label or original_file_name) + "\n\n" + "\n".join(per_page_md)
+                    try:
+                        md_text = await gemini_polish_markdown_by_page(md_text)
+                    except Exception as e:
+                        logger.warning(f"[Gemini-MD] polishing failed, keep original: {e}")
+                    md_output_path = await write_markdown(md_output_path, md_text)
+                status_code = "success" if total_successful_chunks > 0 else "warning"
+                extra = f" Markdown saved to: {md_output_path}" if md_output_path else ""
+                message = f"[Gemini OCR] Processed {total_successful_chunks} new chunks into collection '{collection_name}'.{extra}"
+                final_response = ProcessingResponse(
+                    collection_name=collection_name,
+                    status=status_code,
+                    processed_chunks=total_successful_chunks,
+                    failed_chunks=total_failed_chunks,
+                    message=message,
+                    file_name=original_file_name,
+                )
+            else:
+                # Unstructured mode (เดิม)
+                if LARGE_PDF_MODE:
+                    results: List[Tuple[int, int, str]] = []
+                    for batch in _chunk_list(pages_to_iterate, BATCH_PAGE_SIZE):
+                        logger.info(f"[BG] Batch processing pages: {batch[0]}..{batch[-1]} (size={len(batch)})")
+                        batch_results = await process_batch_pages(
+                            file_bytes=file_bytes,
+                            batch_pages=batch,
+                            source_label=source_label,
+                            collection_name=collection_name,
+                            book_id=book_id,
+                            image_output_dir=image_output_dir,
+                        )
+                        results.extend(batch_results)
+                else:
+                    tasks = [
+                        page_worker_with_semaphore(file_bytes, p, source_label, collection_name, book_id, image_output_dir)
+                        for p in pages_to_iterate
+                    ]
+                    results = await asyncio.gather(*tasks)
+                total_successful_chunks = sum(res[0] for res in results)
+                total_failed_chunks = sum(res[1] for res in results)
+                if SAVE_MD_ENABLED:
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    md_filename = f"{doc_title}_{ts}.md"
+                    md_output_path = os.path.join(OCR_MD_OUTPUT_DIR, md_filename)
+                    md_text = ""
+                    if MD_REBUILD_WHOLEDOC:
+                        md_text = await rebuild_markdown_whole_doc(
+                            file_bytes=file_bytes,
+                            pages_to_iterate=pages_to_iterate,
+                            source_label=source_label,
+                            image_output_dir=image_output_dir,
+                        )
+                    if not md_text:
+                        combined_md = [f"# {source_label or original_file_name}", ""]
+                        for (_, _, page_md) in results:
+                            combined_md.append(page_md)
+                        md_text = "\n".join(combined_md)
+                    try:
+                        md_text = await gemini_polish_markdown_by_page(md_text)
+                    except Exception as e:
+                        logger.warning(f"[Gemini-MD] polishing failed, keep original: {e}")
+                    md_output_path = await write_markdown(md_output_path, md_text)
+                status_code = "success" if total_successful_chunks > 0 else "warning"
+                extra = f" Markdown saved to: {md_output_path}" if md_output_path else ""
+                message = f"Processed {total_successful_chunks} new chunks into collection '{collection_name}'.{extra}"
+                final_response = ProcessingResponse(
+                    collection_name=collection_name,
+                    status=status_code,
+                    processed_chunks=total_successful_chunks,
+                    failed_chunks=total_failed_chunks,
+                    message=message,
+                    file_name=original_file_name,
+                )
         await update_job_status(file_path_key, "completed", {"result": json.loads(final_response.model_dump_json())})
     except Exception as e:
         logger.error(f"[BG Task] Critical error: {e}", exc_info=True)
@@ -1740,27 +2133,25 @@ async def process_pdf_in_background(
             processed_chunks=0,
             failed_chunks=0,
             message=error_message,
-            file_name=original_file_name
+            file_name=original_file_name,
         )
         await update_job_status(file_path_key, "failed", {"error": error_message})
     finally:
         if final_response:
             await notify_webhook(final_response)
 
-# ---------- Lifespan ----------
+# -------------------- Lifespan --------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global vision_model, md_model, qdrant_client, semaphore_embedding_call, page_processing_semaphore, embedding_http_session, idle_watchdog_task
     logger.info("Application startup initiated...")
-
     required_vars = [GEMINI_API_KEY, QDRANT_URL, QDRANT_API_KEY, LIBRARY_API_TOKEN]
     if not all(required_vars):
         logger.critical("Missing required environment variables. Shutting down.")
         sys.exit(1)
-
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        vision_model = genai.GenerativeModel('gemini-2.5-flash')
+        vision_model = genai.GenerativeModel("gemini-2.5-flash")
         if USE_GEMINI_MD:
             md_model = genai.GenerativeModel(
                 GEMINI_MD_MODEL,
@@ -1773,44 +2164,37 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.critical(f"Failed to connect to Gemini: {e}", exc_info=True)
         sys.exit(1)
-
     try:
-        qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False, timeout=60, port=443, https=True)
+        qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False, timeout=60)
         await asyncio.to_thread(qdrant_client.get_collections)
         logger.info("Qdrant Cloud Client connected.")
     except Exception as e:
         logger.critical(f"Failed to connect to Qdrant: {e}", exc_info=True)
         sys.exit(1)
-
     semaphore_embedding_call = asyncio.Semaphore(CONCURRENCY)
     page_processing_semaphore = asyncio.Semaphore(PAGE_CONCURRENCY)
     embedding_http_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=CONCURRENCY))
     logger.info("Service startup complete.")
-
     await mark_activity("startup")
     asyncio.create_task(notify_startup())
     idle_watchdog_task = asyncio.create_task(idle_watchdog())
-
     yield
-
     if idle_watchdog_task:
         idle_watchdog_task.cancel()
         await asyncio.gather(idle_watchdog_task, return_exceptions=True)
-
     if embedding_http_session:
         await asyncio.wait_for(embedding_http_session.close(), timeout=10)
-
     logger.info("Application shutdown.")
 
-# ---------- FastAPI app ----------
+# -------------------- FastAPI app --------------------
 app = FastAPI(
-    title="บริการประมวลผล PDF (Unstructured + Multi-modal RAG)",
-    description="ใช้ Unstructured framework เพื่อวิเคราะห์โครงสร้างเอกสารและสร้าง Index แบบ Multi-modal พร้อมบันทึกผลเป็น Markdown",
-    version="4.5.0",
-    lifespan=lifespan
+    title="บริการประมวลผล PDF (Unstructured + Gemini OCR)",
+    description="โหมด unstructured เดิม หรือโหมด gemini ที่ใช้ Unstructured ดึงรูป + Gemini OCR ข้อความ และบันทึก Markdown พร้อม path รูป",
+    version="4.6.1",
+    lifespan=lifespan,
 )
 
-# ---------- Endpoints ----------
+# -------------------- Endpoints --------------------
 @app.post("/process_pdf/", response_model=AcknowledgementResponse, status_code=status.HTTP_202_ACCEPTED)
 async def process_pdf_file(
     background_tasks: BackgroundTasks, file: UploadFile = File(...), pages: Optional[str] = Form(None), collection_name: Optional[str] = Form(None)
@@ -1819,9 +2203,7 @@ async def process_pdf_file(
     file_path_key = file.filename
     file_bytes = await file.read()
     await update_job_status(file_path_key, "queued", {"file_path": file_path_key})
-    background_tasks.add_task(
-        process_pdf_in_background, file_path_key, file_bytes, file.filename, pages, collection_name
-    )
+    background_tasks.add_task(process_pdf_in_background, file_path_key, file_bytes, file.filename, pages, collection_name)
     return AcknowledgementResponse(message="Task accepted.", file_path=file_path_key, task_status="queued")
 
 @app.post("/process_from_library/", response_model=AcknowledgementResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -1833,7 +2215,7 @@ async def process_from_library(request: LibrarySearchRequest, background_tasks: 
     if not found_files:
         raise HTTPException(status_code=404, detail=f"ไม่พบหนังสือใน Library: '{request.query}'")
     file_to_process = found_files[0]
-    file_id = file_to_process.get('id') or file_to_process.get('path')
+    file_id = file_to_process.get("id") or file_to_process.get("path")
     if not file_id:
         raise HTTPException(status_code=500, detail="ข้อมูลจาก Library API ไม่มี 'id' หรือ 'path' ของไฟล์")
     download_result = await download_book_from_library(str(file_id))
@@ -1872,9 +2254,7 @@ async def get_job_status(file_path: str = Query(..., description="File Path from
     return JobStatusResponse(file_path=file_path, details=job_details)
 
 @app.get("/collections/{collection_name}/sources", response_model=SourceListResponse)
-async def get_sources_in_collection(
-    collection_name: str = Path(..., description="ชื่อของ Collection ที่ต้องการตรวจสอบ")
-):
+async def get_sources_in_collection(collection_name: str = Path(..., description="ชื่อของ Collection ที่ต้องการตรวจสอบ")):
     await mark_activity("endpoint:get_sources_in_collection")
     try:
         sources = await list_unique_sources_in_collection(collection_name)
@@ -1918,10 +2298,8 @@ async def cleanup_by_book_id(request: CleanupByBookIdRequest):
     if qdrant_client is None:
         raise HTTPException(status_code=503, detail="Qdrant client is not available.")
     await mark_activity("endpoint:cleanup_by_book_id")
-
     if not request.book_id or not str(request.book_id).strip():
         raise HTTPException(status_code=400, detail="ต้องระบุ book_id")
-
     if request.collection_name:
         collections = [request.collection_name.strip()]
     else:
@@ -1929,23 +2307,18 @@ async def cleanup_by_book_id(request: CleanupByBookIdRequest):
             collections = await _list_all_collections()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"ไม่สามารถดึงรายชื่อ collections: {e}")
-
     if not collections:
         return CleanupByBookIdResponse(total_matched=0, total_deleted=0, dry_run=request.dry_run, details=[])
-
     qfilter = await _qdrant_build_book_filter(request.book_id)
-
     total_matched = 0
     total_deleted = 0
     details: List[Dict[str, Any]] = []
-
     for col in collections:
         try:
             matched = await _qdrant_count_by_filter(col, qfilter)
         except Exception as e:
             details.append({"collection": col, "matched": 0, "deleted": 0, "status": "error", "error": str(e)})
             continue
-
         deleted = 0
         if not request.dry_run and matched > 0:
             try:
@@ -1956,37 +2329,35 @@ async def cleanup_by_book_id(request: CleanupByBookIdRequest):
                 details.append({"collection": col, "matched": matched, "deleted": 0, "status": "error", "error": str(e)})
                 total_matched += matched
                 continue
-
         total_matched += matched
         total_deleted += deleted
-        details.append({
-            "collection": col,
-            "matched": matched,
-            "deleted": deleted if not request.dry_run else 0,
-            "status": "ok" if (request.dry_run or deleted == matched) else "partial"
-        })
-
+        details.append(
+            {
+                "collection": col,
+                "matched": matched,
+                "deleted": deleted if not request.dry_run else 0,
+                "status": "ok" if (request.dry_run or deleted == matched) else "partial",
+            }
+        )
     return CleanupByBookIdResponse(
         total_matched=total_matched,
         total_deleted=total_deleted if not request.dry_run else 0,
         dry_run=request.dry_run,
-        details=details
+        details=details,
     )
 
 @app.get("/")
 async def root():
     await mark_activity("endpoint:root")
-    return {"message": "บริการประมวลผล PDF (Unstructured + Multi-modal) กำลังทำงาน. ใช้ /docs สำหรับเอกสาร API."}
+    return {
+        "message": "บริการประมวลผล PDF (Unstructured + Multi-modal/Gemini OCR) กำลังทำงาน. ใช้ /docs สำหรับเอกสาร API."
+    }
 
 @app.get("/health")
 async def health_check():
     global qdrant_client
     await mark_activity("endpoint:health")
-    health_status = {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "components": {}
-    }
+    health_status = {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat(), "components": {}}
     try:
         if qdrant_client:
             await asyncio.to_thread(qdrant_client.get_collections)
@@ -1997,24 +2368,21 @@ async def health_check():
     except Exception as e:
         health_status["components"]["qdrant"] = {"status": "unhealthy", "reason": str(e)}
         health_status["status"] = "unhealthy"
-
     missing_vars = []
     required_vars = {
         "GEMINI_API_KEY": GEMINI_API_KEY,
         "QDRANT_URL": QDRANT_URL,
         "QDRANT_API_KEY": QDRANT_API_KEY,
-        "LIBRARY_API_TOKEN": LIBRARY_API_TOKEN
+        "LIBRARY_API_TOKEN": LIBRARY_API_TOKEN,
     }
     for var_name, var_value in required_vars.items():
         if not var_value:
             missing_vars.append(var_name)
-
     if missing_vars:
         health_status["components"]["environment"] = {"status": "unhealthy", "missing_variables": missing_vars}
         health_status["status"] = "unhealthy"
     else:
         health_status["components"]["environment"] = {"status": "healthy"}
-
     status_code = 200 if health_status["status"] == "healthy" else 503
     return JSONResponse(content=health_status, status_code=status_code)
 
@@ -2029,27 +2397,31 @@ async def get_current_config():
             "ollama_embedding_model": OLLAMA_EMBEDDING_MODEL_NAME,
             "fallback_embedding_url": FALLBACK_EMBEDDING_URL,
             "fallback_embedding_model": FALLBACK_EMBEDDING_MODEL_NAME,
-            "library_api_base_url": LIBRARY_API_BASE_URL
+            "library_api_base_url": LIBRARY_API_BASE_URL,
         },
         "md_export": {
             "enabled": SAVE_MD_ENABLED,
             "output_dir": OCR_MD_OUTPUT_DIR,
             "rebuild_whole_doc": MD_REBUILD_WHOLEDOC,
-            "cli_hints": MD_CLI_HINTS
+            "cli_hints": MD_CLI_HINTS,
         },
-        "large_pdf_mode": {
-            "enabled": LARGE_PDF_MODE,
-            "batch_page_size": BATCH_PAGE_SIZE,
-            "preview_tables": PREVIEW_TABLES
-        },
+        "large_pdf_mode": {"enabled": LARGE_PDF_MODE, "batch_page_size": BATCH_PAGE_SIZE, "preview_tables": PREVIEW_TABLES},
         "gemini": {
             "use_caption": USE_GEMINI_CAPTION,
             "use_md": USE_GEMINI_MD,
-            "md_model": GEMINI_MD_MODEL
-        }
+            "md_model": GEMINI_MD_MODEL,
+            "md_policy": GEMINI_MD_POLICY,
+            "md_lang_hint": GEMINI_MD_LANG_HINT,
+            "ocr_mode": OCR_MODE,
+            "ocr_page_dpi": OCR_PAGE_DPI,
+            "figure_auto_expand": FIGURE_AUTO_EXPAND,
+            "figure_max_growth_px": FIGURE_MAX_GROWTH_PX,
+            "figure_growth_step_px": FIGURE_GROW_STEP_PX,
+            "figure_edge_ink_ratio": FIGURE_EDGE_INK_RATIO,
+            "figure_overlap_iou": FIGURE_OVERLAP_IOU,
+        },
     }
-
-# ---------- Main ----------
+# -------------------- Main --------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8999)
